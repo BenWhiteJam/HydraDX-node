@@ -23,6 +23,9 @@
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::from_over_into)]
 
+#[cfg(test)]
+mod tests;
+
 // Make the WASM binary available.
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
@@ -59,7 +62,7 @@ pub use frame_support::{
 	traits::{Filter, KeyOwnerProofSystem, LockIdentifier, Randomness, U128CurrencyToVote},
 	weights::{
 		constants::{BlockExecutionWeight, RocksDbWeight, WEIGHT_PER_SECOND},
-		DispatchClass, IdentityFee, Pays, Weight,
+		DispatchClass, Pays, Weight, WeightToFeeCoefficient, WeightToFeeCoefficients, WeightToFeePolynomial,
 	},
 	PalletId, StorageValue,
 };
@@ -148,7 +151,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: create_runtime_str!("hydra-dx"),
 	impl_name: create_runtime_str!("hydra-dx"),
 	authoring_version: 1,
-	spec_version: 15,
+	spec_version: 19,
 	impl_version: 0,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
@@ -170,6 +173,34 @@ const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
 /// We allow for 2 seconds of compute with a 6 second average block time.
 pub const MAXIMUM_BLOCK_WEIGHT: Weight = 2 * WEIGHT_PER_SECOND;
 
+use smallvec::smallvec;
+pub struct WeightToFee;
+impl WeightToFeePolynomial for WeightToFee {
+	type Balance = Balance;
+
+	/// Handles converting a weight scalar to a fee value, based on the scale and granularity of the
+	/// node's balance type.
+	///
+	/// This should typically create a mapping between the following ranges:
+	///   - [0, MAXIMUM_BLOCK_WEIGHT]
+	///   - [Balance::min, Balance::max]
+	///
+	/// Yet, it can be used for any other sort of change to weight-fee. Some examples being:
+	///   - Setting it to `0` will essentially disable the weight fee.
+	///   - Setting it to `1` will cause the literal `#[weight = x]` values to be charged.
+	fn polynomial() -> WeightToFeeCoefficients<Self::Balance> {
+		// extrinsic base weight (smallest non-zero weight) is mapped to 1/10 CENT
+		let p = CENTS; // 100_000_000_000
+		let q = 10 * Balance::from(ExtrinsicBaseWeight::get()); // 8_079_830_000
+		smallvec![WeightToFeeCoefficient {
+			degree: 1,
+			negative: false,
+			coeff_frac: Perbill::from_rational(p % q, q),
+			coeff_integer: p / q, // 12
+		}]
+	}
+}
+
 /// The version information used to identify this runtime when compiled natively.
 #[cfg(feature = "std")]
 pub fn native_version() -> NativeVersion {
@@ -180,12 +211,12 @@ pub fn native_version() -> NativeVersion {
 }
 
 pub struct BaseFilter;
+
 impl Filter<Call> for BaseFilter {
 	fn filter(call: &Call) -> bool {
 		match call {
 			Call::AuthorityDiscovery(_)
 			| Call::Authorship(_)
-			| Call::Balances(_)
 			| Call::Babe(_)
 			| Call::Claims(_)
 			| Call::Council(_)
@@ -210,6 +241,7 @@ impl Filter<Call> for BaseFilter {
 
 			Call::XYK(_)
 			| Call::AssetRegistry(_)
+			| Call::Balances(_)
 			| Call::Currencies(_)
 			| Call::Exchange(_)
 			| Call::Faucet(_)
@@ -334,6 +366,7 @@ impl pallet_timestamp::Config for Runtime {
 parameter_types! {
 	pub const ExistentialDeposit: u128 = 0;
 	pub const MaxLocks: u32 = 50;
+	pub const MaxReserves: u32 = 50;
 }
 
 impl pallet_balances::Config for Runtime {
@@ -346,21 +379,28 @@ impl pallet_balances::Config for Runtime {
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
 	type WeightInfo = ();
+	type MaxReserves = MaxReserves;
+	type ReserveIdentifier = [u8; 8];
 }
 
 parameter_types! {
-	pub const TransactionByteFee: Balance = 1;
+	pub const TransactionByteFee: Balance = 10 * MILLICENTS;
 	pub const MultiPaymentCurrencySetFee: Pays = Pays::No;
-
+	/// The portion of the `NORMAL_DISPATCH_RATIO` that we adjust the fees with. Blocks filled less
+	/// than this will decrease the weight and more will increase.
 	pub const TargetBlockFullness: Perquintill = Perquintill::from_percent(25);
-	pub AdjustmentVariable: Multiplier = Multiplier::saturating_from_rational(1, 100_000);
+	/// The adjustment variable of the runtime. Higher values will cause `TargetBlockFullness` to
+	/// change the fees more rapidly.
+	pub AdjustmentVariable: Multiplier = Multiplier::saturating_from_rational(3, 100_000);
+	/// Minimum amount of the multiplier. This value cannot be too low. A test case should ensure
+	/// that combined with `AdjustmentVariable`, we can recover from the minimum.
 	pub MinimumMultiplier: Multiplier = Multiplier::saturating_from_rational(1, 1_000_000_000u128);
 }
 
 impl pallet_transaction_payment::Config for Runtime {
 	type OnChargeTransaction = MultiCurrencyAdapter<Balances, (), MultiTransactionPayment>;
 	type TransactionByteFee = TransactionByteFee;
-	type WeightToFee = IdentityFee<Balance>;
+	type WeightToFee = WeightToFee;
 	type FeeMultiplierUpdate = TargetedFeeAdjustment<Self, TargetBlockFullness, AdjustmentVariable, MinimumMultiplier>;
 }
 
@@ -371,7 +411,7 @@ impl pallet_transaction_multi_payment::Config for Runtime {
 	type AMMPool = XYK;
 	type WeightInfo = pallet_transaction_multi_payment::weights::HydraWeight<Runtime>;
 	type WithdrawFeeForSetCurrency = MultiPaymentCurrencySetFee;
-	type WeightToFee = IdentityFee<Balance>;
+	type WeightToFee = WeightToFee;
 }
 
 impl pallet_genesis_history::Config for Runtime {}
@@ -433,6 +473,7 @@ impl orml_tokens::Config for Runtime {
 	type WeightInfo = ();
 	type ExistentialDeposits = ExistentialDeposits;
 	type OnDust = ();
+	type MaxLocks = MaxLocks;
 }
 
 impl orml_currencies::Config for Runtime {
@@ -491,6 +532,14 @@ pub mod constants;
 /// Staking pallets configurations
 pub mod impls;
 use constants::{currency::*, time::*};
+#[cfg(feature = "runtime-benchmarks")]
+use frame_benchmarking::frame_support::max_encoded_len::MaxEncodedLen;
+#[cfg(feature = "runtime-benchmarks")]
+use frame_benchmarking::frame_support::pallet_prelude::EnsureOrigin;
+#[cfg(feature = "runtime-benchmarks")]
+use frame_benchmarking::frame_support::pallet_prelude::{Get, Member};
+#[cfg(feature = "runtime-benchmarks")]
+use frame_benchmarking::frame_support::Parameter;
 use pallet_im_online::sr25519::AuthorityId as ImOnlineId;
 pub use pallet_staking::StakerStatus;
 use pallet_transaction_payment::{Multiplier, TargetedFeeAdjustment};
@@ -552,6 +601,7 @@ impl pallet_staking::Config for Runtime {
 	type UnixTime = Timestamp;
 	type CurrencyToVote = U128CurrencyToVote;
 	type ElectionProvider = ElectionProviderMultiPhase;
+	type GenesisElectionProvider = ElectionProviderMultiPhase;
 	const MAX_NOMINATIONS: u32 = MAX_NOMINATIONS;
 	type RewardRemainder = Treasury;
 	type Event = Event;
@@ -686,7 +736,9 @@ impl pallet_election_provider_multi_phase::Config for Runtime {
 	type Fallback = Fallback;
 	type BenchmarkingConfig = ();
 	type WeightInfo = ();
-	type MinerMaxLength = (); // TODO: what value here ?
+	type MinerMaxLength = ();
+	type OffchainRepeat = ();
+	type ForceOrigin = EnsureRootOrHalfCouncil;
 }
 
 parameter_types! {
@@ -698,6 +750,8 @@ parameter_types! {
 	pub OffchainSolutionWeightLimit: Weight = BlockWeights::get().max_block
 				  .saturating_sub(BlockExecutionWeight::get())
 				  .saturating_sub(ExtrinsicBaseWeight::get());
+
+	pub const MaxApprovals: u32 = 100;
 }
 
 type AllCouncilMembers = pallet_collective::EnsureProportionAtLeast<_1, _1, AccountId, CouncilCollective>;
@@ -717,6 +771,7 @@ impl pallet_treasury::Config for Runtime {
 	type BurnDestination = ();
 	type WeightInfo = ();
 	type SpendFunds = ();
+	type MaxApprovals = MaxApprovals;
 }
 
 parameter_types! {
@@ -942,7 +997,6 @@ impl pallet_offences::Config for Runtime {
 	type Event = Event;
 	type IdentificationTuple = pallet_session::historical::IdentificationTuple<Self>;
 	type OnOffenceHandler = Staking;
-	type WeightSoftLimit = OffencesWeightSoftLimit;
 }
 
 parameter_types! {
@@ -961,6 +1015,8 @@ impl pallet_scheduler::Config for Runtime {
 	type WeightInfo = ();
 }
 
+impl pallet_randomness_collective_flip::Config for Runtime {}
+
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
 	pub enum Runtime where
@@ -970,7 +1026,6 @@ construct_runtime!(
 	{
 		System: frame_system::{Pallet, Call, Config, Storage, Event<T>},
 		RandomnessCollectiveFlip: pallet_randomness_collective_flip::{Pallet, Call, Storage},
-
 
 		Babe: pallet_babe::{Pallet, Call, Storage, Config, ValidateUnsigned},
 
@@ -1009,7 +1064,7 @@ construct_runtime!(
 		Claims: pallet_claims::{Pallet, Call, Storage, Event<T>, Config<T>},
 		Exchange: pallet_exchange::{Pallet, Call, Storage, Event<T>},
 		Faucet: pallet_faucet::{Pallet, Call, Storage, Config, Event<T>},
-		MultiTransactionPayment: pallet_transaction_multi_payment::{Pallet, Call, Storage, Event<T>},
+		MultiTransactionPayment: pallet_transaction_multi_payment::{Pallet, Call, Config<T>, Storage, Event<T>},
 		GenesisHistory: pallet_genesis_history::{Pallet, Storage, Config},
 	}
 );
@@ -1140,10 +1195,6 @@ impl_runtime_apis! {
 			data: sp_inherents::InherentData,
 		) -> sp_inherents::CheckInherentsResult {
 			data.check_extrinsics(&block)
-		}
-
-		fn random_seed() -> <Block as BlockT>::Hash {
-			RandomnessCollectiveFlip::random_seed().0
 		}
 	}
 
