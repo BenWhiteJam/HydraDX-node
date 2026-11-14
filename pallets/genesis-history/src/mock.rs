@@ -18,24 +18,21 @@
 use super::*;
 pub use crate as pallet_genesis_history;
 use frame_support::parameter_types;
+use frame_support::traits::Everything;
 use frame_system as system;
 use sp_core::H256;
 use sp_runtime::{
-	testing::Header,
 	traits::{BlakeTwo256, IdentityLookup},
+	BuildStorage,
 };
 
-type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<Test>;
 type Block = frame_system::mocking::MockBlock<Test>;
 
 frame_support::construct_runtime!(
-	pub enum Test where
-		Block = Block,
-		NodeBlock = Block,
-		UncheckedExtrinsic = UncheckedExtrinsic,
+	pub enum Test
 	{
-		System: frame_system::{Pallet, Call, Config, Storage, Event<T>},
-		GenesisHistory: pallet_genesis_history::{Pallet, Storage, Config},
+		System: frame_system,
+		GenesisHistory: pallet_genesis_history,
 	}
 );
 
@@ -45,20 +42,20 @@ parameter_types! {
 }
 
 impl system::Config for Test {
-	type BaseCallFilter = ();
+	type BaseCallFilter = Everything;
 	type BlockWeights = ();
 	type BlockLength = ();
 	type DbWeight = ();
-	type Origin = Origin;
-	type Call = Call;
-	type Index = u64;
-	type BlockNumber = u64;
+	type RuntimeOrigin = RuntimeOrigin;
+	type RuntimeCall = RuntimeCall;
+	type RuntimeTask = RuntimeTask;
+	type Nonce = u64;
+	type Block = Block;
 	type Hash = H256;
 	type Hashing = BlakeTwo256;
 	type AccountId = u64;
 	type Lookup = IdentityLookup<Self::AccountId>;
-	type Header = Header;
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type BlockHashCount = BlockHashCount;
 	type Version = ();
 	type PalletInfo = PalletInfo;
@@ -68,10 +65,18 @@ impl system::Config for Test {
 	type SystemWeightInfo = ();
 	type SS58Prefix = SS58Prefix;
 	type OnSetCode = ();
+	type MaxConsumers = frame_support::traits::ConstU32<16>;
+	type SingleBlockMigrations = ();
+	type MultiBlockMigrator = ();
+	type PreInherents = ();
+	type PostInherents = ();
+	type PostTransactions = ();
+	type ExtensionsWeightInfo = ();
 }
 
 impl pallet_genesis_history::Config for Test {}
 
+#[derive(Default)]
 pub struct ExtBuilder {
 	pub chain: Chain,
 }
@@ -79,20 +84,13 @@ pub struct ExtBuilder {
 impl ExtBuilder {
 	// builds genesis config
 	pub fn build(self) -> sp_io::TestExternalities {
-		let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+		let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
 
-		let build = pallet_genesis_history::GenesisConfig {
-			previous_chain: self.chain.clone(),
+		let build = pallet_genesis_history::GenesisConfig::<Test> {
+			previous_chain: self.chain,
+			..Default::default()
 		};
-		build.assimilate_storage::<Test>(&mut t).unwrap();
+		build.assimilate_storage(&mut t).unwrap();
 		t.into()
-	}
-}
-
-impl Default for ExtBuilder {
-	fn default() -> Self {
-		Self {
-			chain: Default::default(),
-		}
 	}
 }

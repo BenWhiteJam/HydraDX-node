@@ -1,6 +1,6 @@
-// This file is part of HydraDX.
+// This file is part of Basilisk-node.
 
-// Copyright (C) 2020-2021  Intergalactic, Limited (GIB).
+// Copyright (C) 2020-2022  Intergalactic, Limited (GIB).
 // SPDX-License-Identifier: Apache-2.0
 
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,73 +16,84 @@
 // limitations under the License.
 
 use super::*;
-use crate as multi_payment;
-use crate::{Config, MultiCurrencyAdapter};
-use frame_support::{parameter_types, weights::DispatchClass};
-use frame_system as system;
-use orml_traits::parameter_type_with_key;
-use sp_core::H256;
-use sp_runtime::{
-	testing::Header,
-	traits::{BlakeTwo256, IdentityLookup, Zero},
-	Perbill,
+pub use crate as multi_payment;
+use crate::{Config, TransferFees};
+use hydra_dx_math::types::Ratio;
+
+use frame_support::dispatch::{DispatchResultWithPostInfo, PostDispatchInfo};
+use frame_support::{
+	dispatch::DispatchClass,
+	parameter_types,
+	sp_runtime::{
+		traits::{BlakeTwo256, IdentifyAccount, IdentityLookup, Verify},
+		BuildStorage, MultiSignature, Perbill,
+	},
+	traits::{Everything, Get, Nothing},
+	weights::{IdentityFee, Weight},
 };
+use frame_system as system;
+use hydradx_traits::{
+	evm::{EvmFeePayerSupport, InspectEvmAccounts},
+	router::{RouteProvider, Trade},
+	AssetKind, OraclePeriod, PriceOracle,
+};
+use orml_traits::{currency::MutationHooks, parameter_type_with_key};
+use pallet_currencies::{fungibles::FungibleCurrencies, BasicCurrencyAdapter, MockBoundErc20, MockErc20Currency};
+use sp_core::{H160, H256, U256};
+use sp_std::cell::RefCell;
 
-use frame_support::weights::IdentityFee;
-use frame_support::weights::Weight;
-use orml_currencies::BasicCurrencyAdapter;
-use primitives::{Amount, AssetId, Balance, Price};
+pub type AccountId = <<MultiSignature as Verify>::Signer as IdentifyAccount>::AccountId;
+pub type Balance = u128;
+pub type AssetId = u32;
+pub type Amount = i128;
 
-use pallet_xyk::AssetPairAccountIdFor;
-use std::cell::RefCell;
+pub const INITIAL_BALANCE: Balance = 1_000_000_000_000_000u128;
 
-use frame_support::traits::{GenesisBuild, Get};
-use primitives::fee;
-
-pub type AccountId = u64;
-
-pub const INITIAL_BALANCE: Balance = 1000_000_000_000_000u128;
-
-pub const ALICE: AccountId = 1;
-pub const BOB: AccountId = 2;
-pub const FALLBACK_ACCOUNT: AccountId = 300;
+pub const ALICE: AccountId = AccountId::new([1; 32]);
+pub const BOB: AccountId = AccountId::new([2; 32]);
+pub const CHARLIE: AccountId = AccountId::new([3; 32]);
+pub const DAVE: AccountId = AccountId::new([4; 32]);
+pub const FEE_RECEIVER: AccountId = AccountId::new([5; 32]);
 
 pub const HDX: AssetId = 0;
-pub const SUPPORTED_CURRENCY_NO_BALANCE: AssetId = 2000;
-pub const SUPPORTED_CURRENCY_WITH_BALANCE: AssetId = 3000;
-pub const NOT_SUPPORTED_CURRENCY: AssetId = 4000;
+pub const WETH: AssetId = 20;
+pub const SUPPORTED_CURRENCY: AssetId = 2000;
+pub const SUPPORTED_CURRENCY_WITH_PRICE: AssetId = 3000;
+pub const UNSUPPORTED_CURRENCY: AssetId = 4000;
+pub const INSUFFICIENT_CURRENCY: AssetId = 10000;
+pub const SUPPORTED_CURRENCY_NO_BALANCE: AssetId = 5000; // Used for insufficient balance testing
+pub const HIGH_ED_CURRENCY: AssetId = 6000;
+pub const HIGH_VALUE_CURRENCY: AssetId = 7000;
+
+pub const HIGH_ED: Balance = 5;
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
-const MAX_BLOCK_WEIGHT: Weight = 1024;
+const MAX_BLOCK_WEIGHT: Weight = Weight::from_parts(1024, 0);
 
 thread_local! {
-		static EXTRINSIC_BASE_WEIGHT: RefCell<u64> = RefCell::new(0);
+	static EXTRINSIC_BASE_WEIGHT: RefCell<Weight> = const { RefCell::new(Weight::zero()) };
 }
 
 pub struct ExtrinsicBaseWeight;
-impl Get<u64> for ExtrinsicBaseWeight {
-	fn get() -> u64 {
+impl Get<Weight> for ExtrinsicBaseWeight {
+	fn get() -> Weight {
 		EXTRINSIC_BASE_WEIGHT.with(|v| *v.borrow())
 	}
 }
 
-type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<Test>;
 type Block = frame_system::mocking::MockBlock<Test>;
 
 frame_support::construct_runtime!(
-	pub enum Test where
-	 Block = Block,
-	 NodeBlock = Block,
-	 UncheckedExtrinsic = UncheckedExtrinsic,
+	pub enum Test
 	 {
-		 System: frame_system::{Pallet, Call, Config, Storage, Event<T>},
-		 PaymentPallet: multi_payment::{Pallet, Call, Storage, Event<T>},
-		 TransactionPayment: pallet_transaction_payment::{Pallet, Storage},
-		 XYKPallet: pallet_xyk::{Pallet, Call, Storage, Event<T>},
-		 Balances: pallet_balances::{Pallet,Call, Storage,Config<T>, Event<T>},
-		 Currencies: orml_currencies::{Pallet, Event<T>},
-		 AssetRegistry: pallet_asset_registry::{Pallet, Storage},
-		 Tokens: orml_tokens::{Pallet, Event<T>},
+		 System: frame_system,
+		 PaymentPallet: multi_payment,
+		 TransactionPayment: pallet_transaction_payment,
+		 Balances: pallet_balances,
+		 Currencies: pallet_currencies,
+		 Tokens: orml_tokens,
+		 EVMAccounts: pallet_evm_accounts,
+		 Utility: pallet_utility,
 	 }
 
 );
@@ -91,46 +102,47 @@ parameter_types! {
 	pub const BlockHashCount: u64 = 250;
 	pub const SS58Prefix: u8 = 63;
 
-	pub const HdxAssetId: u32 = 0;
-	pub const ExistentialDeposit: u128 = 0;
+	pub const HdxAssetId: u32 = HDX;
+	pub const EvmAssetId: u32 = WETH;
+	pub const ExistentialDeposit: u128 = 2;
 	pub const MaxLocks: u32 = 50;
-	pub const TransactionByteFee: Balance = 1;
+	pub const RegistryStringLimit: u32 = 100;
+	pub const FeeReceiver: AccountId = FEE_RECEIVER;
 
 	pub RuntimeBlockWeights: system::limits::BlockWeights = system::limits::BlockWeights::builder()
-		.base_block(10)
+		.base_block(Weight::zero())
 		.for_class(DispatchClass::all(), |weights| {
 			weights.base_extrinsic = ExtrinsicBaseWeight::get();
 		})
 		.for_class(DispatchClass::Normal, |weights| {
-			weights.max_total = Some(NORMAL_DISPATCH_RATIO * MAX_BLOCK_WEIGHT);
+			weights.max_total = (NORMAL_DISPATCH_RATIO * MAX_BLOCK_WEIGHT).set_proof_size(u64::MAX).into();
 		})
 		.for_class(DispatchClass::Operational, |weights| {
-			weights.max_total = Some(MAX_BLOCK_WEIGHT);
-			weights.reserved = Some(
-				MAX_BLOCK_WEIGHT - NORMAL_DISPATCH_RATIO * MAX_BLOCK_WEIGHT
-			);
+			weights.max_total = (NORMAL_DISPATCH_RATIO * MAX_BLOCK_WEIGHT).set_proof_size(u64::MAX).into();
+		})
+		.for_class(DispatchClass::Operational, |weights| {
+			weights.max_total = MAX_BLOCK_WEIGHT.set_proof_size(u64::MAX).into();
 		})
 		.avg_block_initialization(Perbill::from_percent(0))
 		.build_or_panic();
 
-	pub ExchangeFeeRate: fee::Fee = fee::Fee::default();
-	 pub PayForSetCurrency : Pays = Pays::No;
+	pub ExchangeFeeRate: (u32, u32) = (2, 1_000);
 }
 
 impl system::Config for Test {
-	type BaseCallFilter = ();
+	type BaseCallFilter = Everything;
 	type BlockWeights = RuntimeBlockWeights;
 	type BlockLength = ();
-	type Origin = Origin;
-	type Call = Call;
-	type Index = u64;
-	type BlockNumber = u64;
+	type RuntimeOrigin = RuntimeOrigin;
+	type RuntimeCall = RuntimeCall;
+	type RuntimeTask = RuntimeTask;
+	type Nonce = u64;
+	type Block = Block;
 	type Hash = H256;
 	type Hashing = BlakeTwo256;
-	type AccountId = u64;
+	type AccountId = AccountId;
 	type Lookup = IdentityLookup<Self::AccountId>;
-	type Header = Header;
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type BlockHashCount = BlockHashCount;
 	type DbWeight = ();
 	type Version = ();
@@ -141,116 +153,259 @@ impl system::Config for Test {
 	type SystemWeightInfo = ();
 	type SS58Prefix = SS58Prefix;
 	type OnSetCode = ();
+	type MaxConsumers = frame_support::traits::ConstU32<16>;
+	type SingleBlockMigrations = ();
+	type MultiBlockMigrator = ();
+	type PreInherents = ();
+	type PostInherents = ();
+	type PostTransactions = ();
+	type ExtensionsWeightInfo = ();
 }
 
 impl Config for Test {
-	type Event = Event;
-	type Currency = Balances;
-	type MultiCurrency = Currencies;
-	type AMMPool = XYKPallet;
+	type AcceptedCurrencyOrigin = frame_system::EnsureRoot<AccountId>;
+	type Currencies = Currencies;
+	type RouteProvider = DefaultRouteProvider;
+	type OraclePriceProvider = PriceProviderMock;
 	type WeightInfo = ();
-	type WithdrawFeeForSetCurrency = PayForSetCurrency;
 	type WeightToFee = IdentityFee<Balance>;
+	type NativeAssetId = HdxAssetId;
+	type EvmAssetId = EvmAssetId;
+	type InspectEvmAccounts = EVMAccounts;
+	type EvmPermit = PermitDispatchHandler;
+	type TryCallCurrency<'a> = TestCallCurrency<Test>;
+	type EvmFeePayer = MockEvmFeePayer;
 }
 
-impl pallet_asset_registry::Config for Test {
+thread_local! {
+	static MOCK_EVM_FEE_PAYER: RefCell<Option<AccountId>> = const { RefCell::new(None) };
+}
+
+/// Mock EVM fee payer override.
+///
+/// Thread-local so tests can observe it. Phase 2 wiring; no production semantics —
+/// the signed branch tests assert that this is set/cleared at the right points.
+pub struct MockEvmFeePayer;
+
+impl EvmFeePayerSupport for MockEvmFeePayer {
+	type AccountId = AccountId;
+
+	fn set_fee_payer(payer: Self::AccountId) -> Option<Self::AccountId> {
+		MOCK_EVM_FEE_PAYER.with(|v| v.borrow_mut().replace(payer))
+	}
+
+	fn clear_fee_payer() -> Option<Self::AccountId> {
+		MOCK_EVM_FEE_PAYER.with(|v| v.borrow_mut().take())
+	}
+}
+
+pub struct DummyRegistry<T>(sp_std::marker::PhantomData<T>);
+
+impl<T: Config> hydradx_traits::registry::Inspect for DummyRegistry<T> {
 	type AssetId = AssetId;
-}
+	type Location = u8;
 
+	fn asset_type(_id: Self::AssetId) -> Option<AssetKind> {
+		unimplemented!()
+	}
+
+	fn is_sufficient(id: Self::AssetId) -> bool {
+		id < INSUFFICIENT_CURRENCY
+	}
+
+	fn decimals(_id: Self::AssetId) -> Option<u8> {
+		unimplemented!()
+	}
+
+	fn exists(_asset_id: AssetId) -> bool {
+		true
+	}
+
+	fn is_banned(_id: Self::AssetId) -> bool {
+		unimplemented!()
+	}
+
+	fn asset_name(_id: Self::AssetId) -> Option<Vec<u8>> {
+		unimplemented!()
+	}
+
+	fn asset_symbol(_id: Self::AssetId) -> Option<Vec<u8>> {
+		unimplemented!()
+	}
+
+	fn existential_deposit(_id: Self::AssetId) -> Option<u128> {
+		unimplemented!()
+	}
+}
+pub struct DefaultRouteProvider;
+
+impl RouteProvider<AssetId> for DefaultRouteProvider {}
+
+pub struct PriceProviderMock {}
+
+impl PriceOracle<AssetId> for PriceProviderMock {
+	type Price = Ratio;
+
+	fn price(route: &[Trade<AssetId>], _period: OraclePeriod) -> Option<Ratio> {
+		let asset_a = route.first().unwrap().asset_in;
+		let asset_b = route.first().unwrap().asset_out;
+		match (asset_a, asset_b) {
+			(SUPPORTED_CURRENCY_WITH_PRICE, HDX) => Some(Ratio::new(1, 10)),
+			// Routable but never whitelisted - a route alone must not make an asset payable.
+			(UNSUPPORTED_CURRENCY, HDX) => Some(Ratio::new(1, 10)),
+			_ => None,
+		}
+	}
+}
 impl pallet_balances::Config for Test {
 	type MaxLocks = MaxLocks;
 	/// The type for recording an account's balance.
 	type Balance = Balance;
 	/// The ubiquitous event type.
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type DustRemoval = ();
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
 	type WeightInfo = ();
 	type MaxReserves = ();
 	type ReserveIdentifier = ();
+	type FreezeIdentifier = ();
+	type MaxFreezes = ();
+	type RuntimeHoldReason = ();
+	type RuntimeFreezeReason = ();
+	type DoneSlashHandler = ();
 }
 
 impl pallet_transaction_payment::Config for Test {
-	type OnChargeTransaction = MultiCurrencyAdapter<Balances, (), PaymentPallet>;
-	type TransactionByteFee = TransactionByteFee;
+	type RuntimeEvent = RuntimeEvent;
+	type OnChargeTransaction = TransferFees<Test, Currencies, DepositAll<Test>, FeeReceiver, ()>;
+	type LengthToFee = IdentityFee<Balance>;
+	type OperationalFeeMultiplier = ();
 	type WeightToFee = IdentityFee<Balance>;
 	type FeeMultiplierUpdate = ();
-}
-pub struct AssetPairAccountIdTest();
-
-impl AssetPairAccountIdFor<AssetId, u64> for AssetPairAccountIdTest {
-	fn from_assets(asset_a: AssetId, asset_b: AssetId) -> u64 {
-		let mut a = asset_a as u128;
-		let mut b = asset_b as u128;
-		if a > b {
-			let tmp = a;
-			a = b;
-			b = tmp;
-		}
-		return (a * 1000 + b) as u64;
-	}
-}
-
-impl pallet_xyk::Config for Test {
-	type Event = Event;
-	type AssetPairAccountId = AssetPairAccountIdTest;
-	type Currency = Currencies;
-	type NativeAssetId = HdxAssetId;
 	type WeightInfo = ();
-	type GetExchangeFee = ExchangeFeeRate;
 }
 
 parameter_type_with_key! {
-	pub ExistentialDeposits: |_currency_id: AssetId| -> Balance {
-		Zero::zero()
+	pub ExistentialDeposits: |currency_id: AssetId| -> Balance {
+		match *currency_id {
+			HIGH_ED_CURRENCY => HIGH_ED,
+			HIGH_VALUE_CURRENCY => 1u128,
+			_ => 2u128
+		}
 	};
 }
 
+parameter_types! {
+	pub const MaxReserves: u32 = 50;
+	pub const ReserveAccount: AccountId = AccountId::new([9u8; 32]);
+}
+
+pub struct CurrencyHooks;
+impl MutationHooks<AccountId, AssetId, Balance> for CurrencyHooks {
+	type OnDust = ();
+	type OnSlash = ();
+	type PreDeposit = ();
+	type PostDeposit = ();
+	type PreTransfer = ();
+	type PostTransfer = ();
+	type OnNewTokenAccount = AddTxAssetOnAccount<Test>;
+	type OnKilledTokenAccount = RemoveTxAssetOnKilled<Test>;
+}
+
 impl orml_tokens::Config for Test {
-	type Event = Event;
 	type Balance = Balance;
 	type Amount = Amount;
 	type CurrencyId = AssetId;
 	type WeightInfo = ();
 	type ExistentialDeposits = ExistentialDeposits;
-	type OnDust = ();
 	type MaxLocks = ();
+	type DustRemovalWhitelist = Nothing;
+	type ReserveIdentifier = ();
+	type MaxReserves = MaxReserves;
+	type CurrencyHooks = CurrencyHooks;
 }
 
-impl orml_currencies::Config for Test {
-	type Event = Event;
+impl pallet_currencies::Config for Test {
 	type MultiCurrency = Tokens;
 	type NativeCurrency = BasicCurrencyAdapter<Test, Balances, Amount, u32>;
+	type Erc20Currency = MockErc20Currency<Test>;
+	type BoundErc20 = MockBoundErc20<Test>;
+	type ReserveAccount = ReserveAccount;
 	type GetNativeCurrencyId = HdxAssetId;
+	type RegistryInspect = MockBoundErc20<Test>;
+	type EgressHandler = pallet_currencies::MockEgressHandler<Test>;
+	type WeightInfo = ();
+}
+
+pub struct EvmNonceProvider;
+impl pallet_evm_accounts::EvmNonceProvider for EvmNonceProvider {
+	fn get_nonce(_: H160) -> U256 {
+		U256::zero()
+	}
+}
+
+pub struct FeeCurrencyMock;
+impl AccountFeeCurrency<AccountId> for FeeCurrencyMock {
+	type AssetId = AssetId;
+
+	fn get(_a: &AccountId) -> Self::AssetId {
+		unimplemented!()
+	}
+	fn set(_who: &AccountId, _asset_id: Self::AssetId) -> DispatchResult {
+		unimplemented!()
+	}
+	fn is_payment_currency(_asset_id: AssetId) -> DispatchResult {
+		unimplemented!()
+	}
+}
+
+impl pallet_evm_accounts::Config for Test {
+	type EvmNonceProvider = EvmNonceProvider;
+	type FeeMultiplier = frame_support::traits::ConstU32<10>;
+	type ControllerOrigin = frame_system::EnsureRoot<AccountId>;
+	type NttEmergencyOrigin = frame_system::EnsureRoot<AccountId>;
+	type AssetId = AssetId;
+	type Currency = FungibleCurrencies<Test>;
+	type ExistentialDeposits = ExistentialDeposits;
+	type FeeCurrency = FeeCurrencyMock;
+	type WeightInfo = ();
+}
+
+impl pallet_utility::Config for Test {
+	type RuntimeEvent = RuntimeEvent;
+	type RuntimeCall = RuntimeCall;
+	type PalletsOrigin = OriginCaller;
+	type BatchHook = ();
 	type WeightInfo = ();
 }
 
 pub struct ExtBuilder {
-	base_weight: u64,
+	base_weight: Weight,
 	native_balances: Vec<(AccountId, Balance)>,
 	endowed_accounts: Vec<(AccountId, AssetId, Balance)>,
-	payment_authority: AccountId,
+	account_currencies: Vec<(AccountId, AssetId)>,
 }
 
 impl Default for ExtBuilder {
 	fn default() -> Self {
 		Self {
-			base_weight: 0,
-			payment_authority: BOB,
-			native_balances: vec![(ALICE, INITIAL_BALANCE), (BOB, 0)],
+			base_weight: Weight::zero(),
+			native_balances: vec![(ALICE, INITIAL_BALANCE)],
 			endowed_accounts: vec![
 				(ALICE, HDX, INITIAL_BALANCE),
-				(ALICE, SUPPORTED_CURRENCY_NO_BALANCE, 0u128), // Used for insufficient balance testing
-				(ALICE, SUPPORTED_CURRENCY_WITH_BALANCE, INITIAL_BALANCE),
+				(ALICE, SUPPORTED_CURRENCY, INITIAL_BALANCE), // used for fallback price test
+				(ALICE, SUPPORTED_CURRENCY_WITH_PRICE, INITIAL_BALANCE),
 			],
+
+			account_currencies: vec![],
 		}
 	}
 }
 
 impl ExtBuilder {
 	pub fn base_weight(mut self, base_weight: u64) -> Self {
-		self.base_weight = base_weight;
+		self.base_weight = Weight::from_parts(base_weight, 0);
 		self
 	}
 	pub fn account_native_balance(mut self, account: AccountId, balance: Balance) -> Self {
@@ -261,15 +416,22 @@ impl ExtBuilder {
 		self.endowed_accounts.push((account, asset, balance));
 		self
 	}
+	pub fn with_currencies(mut self, account_currencies: Vec<(AccountId, AssetId)>) -> Self {
+		self.account_currencies = account_currencies;
+		self
+	}
 	fn set_constants(&self) {
 		EXTRINSIC_BASE_WEIGHT.with(|v| *v.borrow_mut() = self.base_weight);
 	}
 	pub fn build(self) -> sp_io::TestExternalities {
+		use frame_support::traits::OnInitialize;
+
 		self.set_constants();
-		let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+		let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
 
 		pallet_balances::GenesisConfig::<Test> {
 			balances: self.native_balances,
+			dev_accounts: None,
 		}
 		.assimilate_storage(&mut t)
 		.unwrap();
@@ -287,25 +449,154 @@ impl ExtBuilder {
 		buf.extend_from_slice(b"HDT");
 		buf.extend_from_slice(&core_asset.to_le_bytes());
 
-		pallet_asset_registry::GenesisConfig::<Test> {
-			core_asset_id: 0,
-			next_asset_id: 2,
-			asset_ids: vec![(buf.to_vec(), 1)],
-		}
-		.assimilate_storage(&mut t)
-		.unwrap();
-
 		crate::GenesisConfig::<Test> {
 			currencies: vec![
 				(SUPPORTED_CURRENCY_NO_BALANCE, Price::from(1)),
-				(SUPPORTED_CURRENCY_WITH_BALANCE, Price::from_float(1.5)),
+				(SUPPORTED_CURRENCY, Price::from_float(1.5)),
+				(SUPPORTED_CURRENCY_WITH_PRICE, Price::from_float(0.5)),
+				(HIGH_ED_CURRENCY, Price::from(3)),
+				(HIGH_VALUE_CURRENCY, Price::from_inner(100)),
 			],
-			authorities: vec![self.payment_authority],
-			fallback_account: FALLBACK_ACCOUNT,
+			account_currencies: self.account_currencies,
 		}
 		.assimilate_storage(&mut t)
 		.unwrap();
 
-		t.into()
+		let mut ext: sp_io::TestExternalities = t.into();
+		ext.execute_with(|| {
+			System::set_block_number(1);
+			// Make sure the prices are up-to-date.
+			PaymentPallet::on_initialize(1);
+		});
+		ext
 	}
+}
+
+pub fn expect_events(e: Vec<RuntimeEvent>) {
+	test_utils::expect_events::<RuntimeEvent, Test>(e);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PermitDispatchData {
+	pub source: H160,
+	pub target: H160,
+	pub input: Vec<u8>,
+	pub value: U256,
+	pub gas_limit: u64,
+	pub max_fee_per_gas: U256,
+	pub max_priority_fee_per_gas: Option<U256>,
+	pub nonce: Option<U256>,
+	pub access_list: Vec<(H160, Vec<H256>)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidationData {
+	pub source: H160,
+	pub target: H160,
+	pub input: Vec<u8>,
+	pub value: U256,
+	pub gas_limit: u64,
+	pub deadline: U256,
+	pub v: u8,
+	pub r: H256,
+	pub s: H256,
+}
+
+thread_local! {
+	static PERMIT_VALIDATION: RefCell<Vec<ValidationData>> = const { RefCell::new(vec![]) };
+	static PERMIT_DISPATCH: RefCell<Vec<PermitDispatchData>> = const { RefCell::new(vec![]) };
+	/// Fee currency override in force at the moment `dispatch_permit` ran. The pallet clears the
+	/// override once the dispatch returns, so it can only be observed from inside.
+	static PERMIT_DISPATCH_FEE_CURRENCY: RefCell<Option<AssetId>> = const { RefCell::new(None) };
+}
+
+pub struct PermitDispatchHandler;
+
+impl PermitDispatchHandler {
+	pub fn last_validation_call_data() -> ValidationData {
+		PERMIT_VALIDATION.with(|v| v.borrow().last().unwrap().clone())
+	}
+
+	pub fn last_dispatch_call_data() -> PermitDispatchData {
+		PERMIT_DISPATCH.with(|v| v.borrow().last().unwrap().clone())
+	}
+
+	pub fn last_dispatch_fee_currency() -> Option<AssetId> {
+		PERMIT_DISPATCH_FEE_CURRENCY.with(|v| *v.borrow())
+	}
+}
+
+impl EVMPermit for PermitDispatchHandler {
+	fn validate_permit(
+		source: H160,
+		target: H160,
+		input: Vec<u8>,
+		value: U256,
+		gas_limit: u64,
+		deadline: U256,
+		v: u8,
+		r: H256,
+		s: H256,
+	) -> sp_runtime::DispatchResult {
+		let data = ValidationData {
+			source,
+			target,
+			input,
+			value,
+			gas_limit,
+			deadline,
+			v,
+			r,
+			s,
+		};
+		PERMIT_VALIDATION.with(|v| v.borrow_mut().push(data));
+		Ok(())
+	}
+
+	fn dispatch_permit(
+		source: H160,
+		target: H160,
+		input: Vec<u8>,
+		value: U256,
+		gas_limit: u64,
+		max_fee_per_gas: U256,
+		max_priority_fee_per_gas: Option<U256>,
+		nonce: Option<U256>,
+		access_list: Vec<(H160, Vec<H256>)>,
+	) -> DispatchResultWithPostInfo {
+		let data = PermitDispatchData {
+			source,
+			target,
+			input,
+			value,
+			gas_limit,
+			max_fee_per_gas,
+			max_priority_fee_per_gas,
+			nonce,
+			access_list,
+		};
+		PERMIT_DISPATCH.with(|v| v.borrow_mut().push(data));
+
+		let account_id = <EVMAccounts as InspectEvmAccounts<AccountId>>::account_id(source);
+		let currency = crate::Pallet::<Test>::tx_fee_currency_override(account_id);
+		PERMIT_DISPATCH_FEE_CURRENCY.with(|v| *v.borrow_mut() = currency);
+		Ok(PostDispatchInfo::default())
+	}
+
+	fn gas_price() -> (U256, Weight) {
+		(U256::from(222u128), Weight::zero())
+	}
+
+	fn dispatch_weight(gas_limit: u64) -> Weight {
+		// Mock weight: 1 picosecond of refTime per gas unit, no proof size.
+		// Concrete enough for tests that exercise weight bookkeeping; not
+		// representative of production weight.
+		Weight::from_parts(gas_limit, 0)
+	}
+
+	fn permit_nonce(_account: H160) -> U256 {
+		U256::default()
+	}
+
+	fn on_dispatch_permit_error() {}
 }

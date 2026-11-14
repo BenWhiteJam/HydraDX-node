@@ -1,6 +1,6 @@
-# HydraDX node
+# Hydration node
 
-CROSS-CHAIN LIQUIDITY PROTOCOL BUILT ON SUBSTRATE
+CROSS-CHAIN LIQUIDITY PROTOCOL BUILT ON SUBSTRATE (Formerly HydraDX)
 
 ## Contributions & Code of Conduct
 
@@ -27,9 +27,7 @@ Find manual setup instructions at the
 
 ### Build
 
-Once the development environment is set up, build the node. This command will build the
-[Wasm](https://substrate.dev/docs/en/knowledgebase/advanced/executor#wasm-execution) and
-[native](https://substrate.dev/docs/en/knowledgebase/advanced/executor#native-execution) code:
+Once the development environment is set up, build the node:
 
 ```bash
 cargo build --release
@@ -37,135 +35,75 @@ cargo build --release
 
 ## Run
 
-### Single Node Development Chain
+### Mainnet fork with Chopsticks
 
-Purge any existing dev chain state:
+The easiest way to run and interact with Hydration node is to use [Chopsticks](https://github.com/acalanetwork/chopsticks)
+
+```Bash
+npx @acala-network/chopsticks@latest --config=hydradx 
+```
+
+Now you have a test node running at [`ws://localhost:8000`](https://polkadot.js.org/apps/?rpc=ws%3A%2F%2Flocalhost%3A8000#/explorer)
+
+This is also best option to test XCM interactions, as you can run multiple parachains at the same time:
 
 ```bash
-./target/release/hydra-dx purge-chain --dev
+npx @acala-network/chopsticks@latest xcm -p hydradx -p polkadot-asset-hub
 ```
 
-Start a dev chain:
+Refer to the `chopsticks --help` for more options.
+
+### Mainnet fork with Zombienet
+
+If you need to test your app with RPC node which supports everything normal node does like extra RPC methods like `eth_*`. 
+This will spawn forked mainnet chain with regular blocktime.
 
 ```bash
-./target/release/hydra-dx --dev
+docker run -d -p 8000:9988 galacticcouncil/fork
 ```
 
-Or, start a dev chain with detailed logging:
+Now you have a test node running at [`ws://localhost:8000`](https://polkadot.js.org/apps/?rpc=ws%3A%2F%2Flocalhost%3A8000#/explorer)
+
+More details [here](launch-configs/fork)
+
+### Local Testnet with Zombienet
+
+Relay chain repository (polkadot) has to be built in `../polkadot`
+Grab `zombienet` utility used to start network from [releases](https://github.com/paritytech/zombienet/releases)
+
+Start local testnet with 4 relay chain validators and HydraDX as a parachain with 2 collators.
 
 ```bash
-RUST_LOG=debug RUST_BACKTRACE=1 ./target/release/hydra-dx -lruntime=debug --dev
+cd launch-configs/zombienet/
+zombienet spawn local.json
+
+# Enable 2s block time
+npm exec --yes --package=@polkadot/api --package=@polkadot/util-crypto -- node scripts/assign_cores.js
 ```
 
-There is also an option to run the testing runtime with less restrictive settings to facilitate testing of new features.
-The following command starts a dev chain, and the testing runtime is used as a runtime for our node.
+## Interaction with the node
+
+Go to the polkadot apps at https://polkadot.js.org/apps
+
+Connect to 
+- Mainnet: `wss://rpc.hydradx.cloud`
+- local node: `ws://localhost:8000` (if you are using chopsticks)
+
+### Testing of storage migrations and runtime upgrades
+
+The `try-runtime` tool can be used to test storage migrations and runtime upgrades against state from a real chain.
+Run the following command to test against the state on Hydration.
+Don't forget to use a runtime built with `try-runtime` feature.
 ```bash
-./target/release/hydra-dx --dev --runtime=testing
+try-runtime --runtime ./target/release/wbuild/hydradx-runtime/hydradx_runtime.wasm on-runtime-upgrade --checks all live --uri wss://rpc.hydradx.cloud:443
 ```
-The testing runtime currently supports only two chain specifications: _dev_ and _local_ testnet.
-Both runtimes store blockchain data in the same directories( e.g. the _dev_ directory is shared for both runtimes 
-started with the `--dev` parameter. That's why it is important to purge chain data when switching to different runtime( note: `--runtime` parameter can't be used when purging chain data)
+or against HydraDX testnet on Rococo using `--uri wss://paseo-rpc.play.hydration.cloud:443`
 
-### Interaction with the node
+## Useful resources:
 
-Go to the polkadot apps at https://dotapps.io
+* https://github.com/galacticcouncil/hydration-security
+* https://apidocs.bsx.fi/HydraDX
+* https://docs.hydration.net/
 
-Then open settings screen -> developer and paste
-
-*NOTE - FixedU128 type is not yet implemented for polkadot apps. Balance is a measure so price can be reasonably selected. If using polkadot apps to create pool:*
-- 1 Mega Units equals 1:1 price
-- 20 Mega Units equals 20:1 price
-- 50 Kilo Units equals 0.05:1 price
-
-```
-{
-  "types": [
-    {
-      "AssetPair": {
-        "asset_in": "AssetId",
-        "asset_out": "AssetId"
-      },
-      "Amount": "i128",
-      "AmountOf": "Amount",
-      "Address": "AccountId",
-      "OrmlAccountData": {
-        "free": "Balance",
-        "frozen": "Balance",
-        "reserved": "Balance"
-      },
-      "BalanceInfo": {
-        "amount": "Balance",
-        "assetId": "AssetId"
-      },
-      "Chain": {
-        "genesisHash": "Vec<u8>",
-        "lastBlockHash": "Vec<u8>"
-      },
-      "CurrencyId": "AssetId",
-      "CurrencyIdOf": "AssetId",
-      "Intention": {
-        "who": "AccountId",
-        "asset_sell": "AssetId",
-        "asset_buy": "AssetId",
-        "amount": "Balance",
-        "discount": "bool",
-        "sell_or_buy": "IntentionType"
-      },
-      "IntentionId": "Hash",
-      "IntentionType": {
-        "_enum": [
-          "SELL",
-          "BUY"
-        ]
-      },
-      "LookupSource": "AccountId",
-      "OrderedSet": "Vec<AssetId>",
-      "Price": "Balance",
-      "Fee": {
-        "numerator": "u32",
-        "denominator": "u32"
-      }
-    }
-  ],
-  "alias": {
-    "tokens": {
-      "AccountData": "OrmlAccountData"
-    }
-  }
-}
-```
-
-Connect to the
-- Hacknet: `wss://hack.hydradx.io:9944`
-- [Stakenet](https://polkadot.js.org/apps/?rpc=wss%3A%2F%2Frpc-01.snakenet.hydradx.io): `wss://rpc-01.snakenet.hydradx.io`
-- or local node – if you are on chromium based browser, set chrome://flags/#allow-insecure-localhost
-
-### Performance check
-
-Prerequisites: rust/cargo, python 3.8+
-
-With the following script it is possible to run a simple performance check. It might be useful
-to determine whether your machine is suitable to run HydraDX node.
-
-From the top-level node directory:
-
-```bash
-./scripts/check_performance.sh
-```
-
-This will run series of benchmarks ( which may take a while).
-The output will show benchmark results of HydraDX pallets and comparison against reference values.
-
-The most interesting information would be the difference between the HydraDx benchmark value and the local machine's benchmark.
-
-If the difference is >= 0, performance is similar or better.
-However, if the difference < 0 - your machine might not suitable to run HydraDX node. Contact HydraDX devs to discuss the results.
-
-### Running a stakenet node
-
-```bash
-./target/release/hydra-dx --chain lerna
-```
-
-### Honorable contributions
-[@apopiak](https://github.com/apopiak) for great reviews [#87](https://github.com/galacticcouncil/HydraDX-node/pull/87) and support.
+Bug bounty: [https://immunefi.com/bounty/hydration/](https://immunefi.com/bounty/hydration/)
+Reponsible disclosure: security@intergalactic.limited

@@ -1,0 +1,428 @@
+//                    :                     $$\   $$\                 $$\                    $$$$$$$\  $$\   $$\
+//                  !YJJ^                   $$ |  $$ |                $$ |                   $$  __$$\ $$ |  $$ |
+//                7B5. ~B5^                 $$ |  $$ |$$\   $$\  $$$$$$$ | $$$$$$\  $$$$$$\  $$ |  $$ |\$$\ $$  |
+//             .?B@G    ~@@P~               $$$$$$$$ |$$ |  $$ |$$  __$$ |$$  __$$\ \____$$\ $$ |  $$ | \$$$$  /
+//           :?#@@@Y    .&@@@P!.            $$  __$$ |$$ |  $$ |$$ /  $$ |$$ |  \__|$$$$$$$ |$$ |  $$ | $$  $$<
+//         ^?J^7P&@@!  .5@@#Y~!J!.          $$ |  $$ |$$ |  $$ |$$ |  $$ |$$ |     $$  __$$ |$$ |  $$ |$$  /\$$\
+//       ^JJ!.   :!J5^ ?5?^    ^?Y7.        $$ |  $$ |\$$$$$$$ |\$$$$$$$ |$$ |     \$$$$$$$ |$$$$$$$  |$$ /  $$ |
+//     ~PP: 7#B5!.         :?P#G: 7G?.      \__|  \__| \____$$ | \_______|\__|      \_______|\_______/ \__|  \__|
+//  .!P@G    7@@@#Y^    .!P@@@#.   ~@&J:              $$\   $$ |
+//  !&@@J    :&@@@@P.   !&@@@@5     #@@P.             \$$$$$$  |
+//   :J##:   Y@@&P!      :JB@@&~   ?@G!                \______/
+//     .?P!.?GY7:   .. .    ^?PP^:JP~
+//       .7Y7.  .!YGP^ ?BP?^   ^JJ^         This file is part of https://github.com/galacticcouncil/HydraDX-node
+//         .!Y7Y#@@#:   ?@@@G?JJ^           Built with <3 for decentralisation.
+//            !G@@@Y    .&@@&J:
+//              ^5@#.   7@#?.               Copyright (C) 2021-2023  Intergalactic, Limited (GIB).
+//                :5P^.?G7.                 SPDX-License-Identifier: Apache-2.0
+//                  :?Y!                    Licensed under the Apache License, Version 2.0 (the "License");
+//                                          you may not use this file except in compliance with the License.
+//                                          http://www.apache.org/licenses/LICENSE-2.0
+
+use crate::evm::erc20_currency::Function;
+use crate::evm::precompiles::{revert, revert_custom_error};
+use crate::{
+	evm::{
+		precompiles::{
+			erc20_mapping::HydraErc20Mapping,
+			handle::{EvmDataWriter, FunctionModifier, PrecompileHandleExt},
+			substrate::RuntimeHelper,
+			succeed, Address, Output,
+		},
+		ExtendedAddressMapping,
+	},
+	Currencies,
+};
+use codec::{Encode, EncodeLike};
+use ethabi::Token;
+use frame_support::traits::{ExistenceRequirement, IsType, OriginTrait};
+use hydradx_traits::evm::{Erc20Encoding, InspectEvmAccounts};
+use hydradx_traits::registry::Inspect as InspectRegistry;
+use orml_traits::{MultiCurrency as MultiCurrencyT, MultiCurrency};
+use pallet_evm::{AddressMapping, ExitRevert, Precompile, PrecompileFailure, PrecompileHandle, PrecompileResult};
+use primitive_types::{H160, U256};
+use primitives::{AssetId, Balance};
+use sp_runtime::traits::Dispatchable;
+use sp_std::marker::PhantomData;
+
+pub struct MultiCurrencyPrecompile<Runtime>(PhantomData<Runtime>);
+
+impl<Runtime> Precompile for MultiCurrencyPrecompile<Runtime>
+where
+	Runtime: frame_system::Config
+		+ pallet_evm::Config
+		+ pallet_asset_registry::Config
+		+ pallet_currencies::Config
+		+ pallet_evm_accounts::Config
+		+ pallet_circuit_breaker::Config,
+	AssetId: EncodeLike<<Runtime as pallet_asset_registry::Config>::AssetId>,
+	<<Runtime as frame_system::Config>::RuntimeCall as Dispatchable>::RuntimeOrigin: OriginTrait,
+	<Runtime as pallet_asset_registry::Config>::AssetId: From<AssetId>,
+	Currencies: MultiCurrency<Runtime::AccountId, CurrencyId = AssetId, Balance = Balance>,
+	pallet_currencies::Pallet<Runtime>: MultiCurrency<Runtime::AccountId, CurrencyId = AssetId, Balance = Balance>,
+	<Runtime as frame_system::Config>::AccountId:
+		From<sp_runtime::AccountId32> + IsType<sp_runtime::AccountId32> + AsRef<[u8; 32]>,
+{
+	fn execute(handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		let address = handle.code_address();
+		if let Some(asset_id) = HydraErc20Mapping::decode_evm_address(address) {
+			log::debug!(target: "evm", "multicurrency: currency id: {asset_id:?}");
+
+			let selector = handle.read_selector()?;
+
+			handle.check_function_modifier(match selector {
+				Function::Transfer => FunctionModifier::NonPayable,
+				Function::TransferFrom => FunctionModifier::NonPayable,
+				Function::Approve => FunctionModifier::NonPayable,
+				Function::Mint => FunctionModifier::NonPayable,
+				Function::Burn => FunctionModifier::NonPayable,
+				_ => FunctionModifier::View,
+			})?;
+
+			return match selector {
+				Function::Name => Self::name(asset_id, handle),
+				Function::Symbol => Self::symbol(asset_id, handle),
+				Function::Decimals => Self::decimals(asset_id, handle),
+				Function::TotalSupply => Self::total_supply(asset_id, handle),
+				Function::BalanceOf => Self::balance_of(asset_id, handle),
+				Function::Transfer => Self::transfer(asset_id, handle),
+				Function::Allowance => Self::allowance(asset_id, handle),
+				Function::Approve => Self::approve(asset_id, handle),
+				Function::TransferFrom => Self::transfer_from(asset_id, handle),
+				Function::Mint => Self::mint(asset_id, handle),
+				Function::Burn => Self::burn(asset_id, handle),
+			};
+		}
+		Err(PrecompileFailure::Revert {
+			exit_status: ExitRevert::Reverted,
+			output: "invalid currency id".into(),
+		})
+	}
+}
+
+impl<Runtime> MultiCurrencyPrecompile<Runtime>
+where
+	Runtime: frame_system::Config
+		+ pallet_evm::Config
+		+ pallet_asset_registry::Config
+		+ pallet_currencies::Config
+		+ pallet_evm_accounts::Config
+		+ pallet_circuit_breaker::Config,
+	AssetId: EncodeLike<<Runtime as pallet_asset_registry::Config>::AssetId>,
+	<Runtime as pallet_asset_registry::Config>::AssetId: From<AssetId>,
+	Currencies: MultiCurrency<Runtime::AccountId, CurrencyId = AssetId, Balance = Balance>,
+	pallet_currencies::Pallet<Runtime>: MultiCurrency<Runtime::AccountId, CurrencyId = AssetId, Balance = Balance>,
+	<Runtime as frame_system::Config>::AccountId:
+		From<sp_runtime::AccountId32> + IsType<sp_runtime::AccountId32> + AsRef<[u8; 32]>,
+	<<Runtime as frame_system::Config>::RuntimeCall as Dispatchable>::RuntimeOrigin: OriginTrait,
+{
+	fn name(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let input = handle.read_input()?;
+		input.expect_arguments(0)?;
+
+		match <pallet_asset_registry::Pallet<Runtime>>::asset_name(asset_id.into()) {
+			Some(name) => {
+				log::debug!(target: "evm", "multicurrency: symbol: {name:?}");
+
+				let encoded = Output::encode_bytes(name.as_slice());
+
+				Ok(succeed(encoded))
+			}
+			None => Err(PrecompileFailure::Error {
+				exit_status: pallet_evm::ExitError::Other("Non-existing asset.".into()),
+			}),
+		}
+	}
+
+	fn symbol(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let input = handle.read_input()?;
+		input.expect_arguments(0)?;
+
+		match <pallet_asset_registry::Pallet<Runtime>>::asset_symbol(asset_id.into()) {
+			Some(symbol) => {
+				log::debug!(target: "evm", "multicurrency: name: {symbol:?}");
+
+				let encoded = Output::encode_bytes(symbol.as_slice());
+
+				Ok(succeed(encoded))
+			}
+			None => Err(PrecompileFailure::Error {
+				exit_status: pallet_evm::ExitError::Other("Non-existing asset.".into()),
+			}),
+		}
+	}
+
+	fn decimals(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let input = handle.read_input()?;
+		input.expect_arguments(0)?;
+
+		match <pallet_asset_registry::Pallet<Runtime>>::decimals(asset_id.into()) {
+			Some(decimals) => {
+				log::debug!(target: "evm", "multicurrency: decimals: {decimals:?}");
+
+				let encoded = Output::encode_uint::<u8>(decimals);
+
+				Ok(succeed(encoded))
+			}
+			None => Err(PrecompileFailure::Error {
+				exit_status: pallet_evm::ExitError::Other("Non-existing asset.".into()),
+			}),
+		}
+	}
+
+	fn total_supply(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let input = handle.read_input()?;
+		input.expect_arguments(0)?;
+
+		let total_issuance = Currencies::total_issuance(asset_id);
+
+		log::debug!(target: "evm", "multicurrency: totalSupply: {total_issuance:?}");
+
+		let encoded = Output::encode_uint::<u128>(total_issuance);
+
+		Ok(succeed(encoded))
+	}
+
+	fn balance_of(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let mut input = handle.read_input()?;
+		input.expect_arguments(1)?;
+
+		let owner: H160 = input.read::<Address>()?.into();
+		let who: Runtime::AccountId = ExtendedAddressMapping::into_account_id(owner).into(); //TODO: use pallet?
+
+		let free_balance = Currencies::free_balance(asset_id, &who);
+
+		log::debug!(target: "evm", "multicurrency: balanceOf: {free_balance:?}");
+
+		let encoded = Output::encode_uint::<u128>(free_balance);
+
+		Ok(succeed(encoded))
+	}
+
+	fn transfer(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let mut input = handle.read_input()?;
+		input.expect_arguments(2)?;
+
+		let to: H160 = input.read::<Address>()?.into();
+		let amount = input.read::<Balance>()?;
+
+		let origin = ExtendedAddressMapping::into_account_id(handle.context().caller);
+		let to = ExtendedAddressMapping::into_account_id(to);
+
+		log::debug!(target: "evm", "multicurrency: transfer from: {origin:?}, to: {to:?}, amount: {amount:?}");
+
+		<pallet_currencies::Pallet<Runtime> as MultiCurrency<Runtime::AccountId>>::transfer(
+			asset_id,
+			&(<sp_runtime::AccountId32 as Into<Runtime::AccountId>>::into(origin)),
+			&(<sp_runtime::AccountId32 as Into<Runtime::AccountId>>::into(to)),
+			amount,
+			ExistenceRequirement::AllowDeath,
+		)
+		.map_err(|e| PrecompileFailure::Revert {
+			exit_status: ExitRevert::Reverted,
+			output: e.encode(),
+		})?;
+
+		Ok(succeed(EvmDataWriter::new().write(true).build()))
+	}
+
+	fn allowance(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let mut input = handle.read_input()?;
+		input.expect_arguments(2)?;
+
+		let owner: H160 = input.read::<Address>()?.into();
+		let spender: H160 = input.read::<Address>()?.into();
+
+		let allowance =
+			if <pallet_evm_accounts::Pallet<Runtime> as InspectEvmAccounts<Runtime::AccountId>>::is_approved_contract(
+				spender,
+			) {
+				Balance::MAX
+			} else {
+				pallet_evm_accounts::Pallet::<Runtime>::get_allowance(asset_id.into(), owner, spender)
+			};
+
+		let encoded = Output::encode_uint::<u128>(allowance);
+		Ok(succeed(encoded))
+	}
+
+	fn approve(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		let mut input = handle.read_input()?;
+		input.expect_arguments(2)?;
+
+		let spender: H160 = input.read::<Address>()?.into();
+		let amount: Balance = input.read::<Balance>()?;
+
+		let owner: H160 = handle.context().caller;
+
+		pallet_evm_accounts::Pallet::<Runtime>::set_allowance(asset_id.into(), owner, spender, amount);
+
+		crate::evm::precompiles::emit_approval_log(handle, owner, spender, U256::from(amount))?;
+
+		Ok(succeed(EvmDataWriter::new().write(true).build()))
+	}
+
+	fn transfer_from(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let mut input = handle.read_input()?;
+		input.expect_arguments(3)?;
+
+		let origin: H160 = handle.context().caller;
+		let from: H160 = input.read::<Address>()?.into();
+		let to: H160 = input.read::<Address>()?.into();
+		let amount = input.read::<Balance>()?;
+
+		let spender_is_approved =
+			<pallet_evm_accounts::Pallet<Runtime> as InspectEvmAccounts<Runtime::AccountId>>::is_approved_contract(
+				origin,
+			);
+
+		if !spender_is_approved {
+			let allowed: Balance = pallet_evm_accounts::Pallet::<Runtime>::get_allowance(asset_id.into(), from, origin);
+
+			if allowed < amount {
+				return Err(revert("ERC20: insufficient allowance"));
+			}
+
+			// Some ERC-20 tokens treat `type(uint256).max` as an “infinite allowance” and do not decrement it
+			// on `transferFrom`. We mirror that behavior: if `allowed == Balance::MAX`, we skip updating the
+			// stored allowance; otherwise we decrement by `amount`.
+			if allowed != Balance::MAX {
+				pallet_evm_accounts::Pallet::<Runtime>::set_allowance(
+					asset_id.into(),
+					from,
+					origin,
+					allowed.saturating_sub(amount),
+				);
+			}
+		}
+
+		let from = ExtendedAddressMapping::into_account_id(from);
+		let to = ExtendedAddressMapping::into_account_id(to);
+
+		log::debug!(target: "evm", "multicurrency: transferFrom from: {from:?}, to: {to:?}, amount: {amount:?}");
+
+		<pallet_currencies::Pallet<Runtime> as MultiCurrency<Runtime::AccountId>>::transfer(
+			asset_id,
+			&(<sp_runtime::AccountId32 as Into<Runtime::AccountId>>::into(from)),
+			&(<sp_runtime::AccountId32 as Into<Runtime::AccountId>>::into(to)),
+			amount,
+			ExistenceRequirement::AllowDeath,
+		)
+		.map_err(|e| PrecompileFailure::Revert {
+			exit_status: ExitRevert::Reverted,
+			output: e.encode(),
+		})?;
+
+		Ok(succeed(EvmDataWriter::new().write(true).build()))
+	}
+
+	/// INttToken mint: only the NTT minter bound to the asset can call it. Over-limit mints take
+	/// the deposit's PostDeposit circuit-breaker path (reserve excess + lockdown), same as XCM.
+	fn mint(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let mut input = handle.read_input()?;
+		input.expect_arguments(2)?;
+
+		let to: H160 = input.read::<Address>()?.into();
+		let amount = input.read::<Balance>()?;
+
+		Self::ensure_ntt_minter(asset_id, handle.context().caller)?;
+
+		let to = ExtendedAddressMapping::into_account_id(to);
+
+		log::debug!(target: "evm", "multicurrency: mint to: {to:?}, amount: {amount:?}");
+
+		<pallet_currencies::Pallet<Runtime> as MultiCurrency<Runtime::AccountId>>::deposit(
+			asset_id,
+			&(<sp_runtime::AccountId32 as Into<Runtime::AccountId>>::into(to)),
+			amount,
+		)
+		.map_err(|e| PrecompileFailure::Revert {
+			exit_status: ExitRevert::Reverted,
+			output: e.encode(),
+		})?;
+
+		Ok(succeed(EvmDataWriter::new().build()))
+	}
+
+	/// INttToken burn: burns the caller's own balance; only the NTT minter can call it.
+	fn burn(asset_id: AssetId, handle: &mut impl PrecompileHandle) -> PrecompileResult {
+		handle.record_cost(RuntimeHelper::<Runtime>::db_read_gas_cost())?;
+
+		// Parse input
+		let mut input = handle.read_input()?;
+		input.expect_arguments(1)?;
+
+		let amount = input.read::<Balance>()?;
+
+		let caller = handle.context().caller;
+		Self::ensure_ntt_minter(asset_id, caller)?;
+
+		let from: Runtime::AccountId = <sp_runtime::AccountId32 as Into<Runtime::AccountId>>::into(
+			ExtendedAddressMapping::into_account_id(caller),
+		);
+
+		let balance =
+			<pallet_currencies::Pallet<Runtime> as MultiCurrency<Runtime::AccountId>>::free_balance(asset_id, &from);
+		if balance < amount {
+			return Err(revert_custom_error(
+				"InsufficientBalance(uint256,uint256)",
+				&[Token::Uint(U256::from(balance)), Token::Uint(U256::from(amount))],
+			));
+		}
+
+		log::debug!(target: "evm", "multicurrency: burn from: {from:?}, amount: {amount:?}");
+
+		<pallet_currencies::Pallet<Runtime> as MultiCurrency<Runtime::AccountId>>::withdraw(
+			asset_id,
+			&from,
+			amount,
+			ExistenceRequirement::AllowDeath,
+		)
+		.map_err(|e| PrecompileFailure::Revert {
+			exit_status: ExitRevert::Reverted,
+			output: e.encode(),
+		})?;
+
+		Ok(succeed(EvmDataWriter::new().build()))
+	}
+
+	fn ensure_ntt_minter(asset_id: AssetId, caller: H160) -> Result<(), PrecompileFailure> {
+		let asset_id: <Runtime as pallet_evm_accounts::Config>::AssetId = asset_id.into();
+		match pallet_evm_accounts::Pallet::<Runtime>::ntt_minter(asset_id) {
+			Some(minter) if minter == caller => Ok(()),
+			_ => Err(revert_custom_error(
+				"CallerNotMinter(address)",
+				&[Token::Address(caller)],
+			)),
+		}
+	}
+}

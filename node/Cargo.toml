@@ -1,93 +1,144 @@
 [package]
-authors = ['GalacticCouncil']
-build = 'build.rs'
-description = 'Hydra DX'
-edition = '2018'
-homepage = 'https://github.com/galacticcouncil/hydradx-node'
-license = 'Apache 2.0'
-name = 'hydra-dx'
-repository = 'https://github.com/galacticcouncil/hydradx-node'
-version = '6.1.0'
+name = "hydradx"
+version = "15.9.0"
+description = "Hydration node"
+authors = ["GalacticCouncil"]
+edition = "2021"
+license = "Apache 2.0"
+repository = "https://github.com/galacticcouncil/HydraDX-node"
+build = "build.rs"
 
 [[bin]]
-name = 'hydra-dx'
+name = "hydradx"
 
 [package.metadata.docs.rs]
-targets = ['x86_64-unknown-linux-gnu']
+targets = ["x86_64-unknown-linux-gnu"]
 
 [build-dependencies]
-hydra-dx-build-script-utils = {path = '../utils/build-script-utils'}
+hydra-dx-build-script-utils = { workspace = true }
 
 [dependencies]
-jsonrpc-core = '15.0.0'
-serde_json = "1.0.61"
-structopt = '0.3.8'
+codec = { workspace = true }
+hex-literal = { workspace = true }
+jsonrpsee = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+futures-timer = "3.0.3"
+async-trait = { workspace = true }
+hyperv14 = { package = "hyper", features = ["http2", "stream", "tcp"], version = "0.14.29", default-features = true }
+hyper-rustls = { version = "0.24.2", features = ["http1", "http2", "webpki-roots", "tokio-runtime"], default-features = false }
+tokio = { workspace = true, default-features = true }
+threadpool = { version = "1.7" }
+num_cpus = { version = "1.13.1" }
+ethereum = { workspace = true }
+ethabi = { workspace = true }
+kvdb-rocksdb = "0.19.0"
+lru = "0.12"
+rlp = "0.6"
 
 # local dependencies
-common-runtime = {path = '../runtime/common'}
-hydra-dx-runtime = {path = '../runtime/hydra-dx'}
-testing-hydra-dx-runtime = {path = '../runtime/testing-hydra-dx'}
-pallet-xyk-rpc = {path = '../pallets/xyk/rpc'}
-pallet-xyk-rpc-runtime-api = {path = '../pallets/xyk/rpc/runtime-api', default-features = false}
-primitives = {path = '../primitives'}
+hydradx-runtime = { workspace = true, features = ["std"] }
+primitives = { workspace = true }
+pallet-claims = { workspace = true }
+pallet-liquidation = { workspace = true }
+liquidation-worker-support = { workspace = true }
+pallet-ice = { workspace = true, features = ["std"] }
+pallet-omnipool = { workspace = true, features = ["std"] }
+pallet-ice-runtime-api = { workspace = true, features = ["std"] }
+ice-solver = { workspace = true, features = ["std"] }
+amm-simulator = { workspace = true, features = ["std"] }
+ice-support = { workspace = true, features = ["std"] }
+hydradx-traits = { workspace = true, features = ["std"] }
+pepl-worker = { workspace = true }
+pepl-worker-support = { workspace = true }
+cerebro-core = { workspace = true }
+cerebro-hydration = { workspace = true }
+hex = { workspace = true, features = ["std"] }
 
 # Substrate dependencies
-frame-benchmarking = '3.0.0'
-frame-benchmarking-cli = {version = '3.0.0', optional = true}
-futures = '0.3.4'
-hex-literal = "0.3.1"
-pallet-im-online = "3.0.0"
-pallet-staking = '3.0.0'
-pallet-transaction-payment-rpc = '3.0.0'
-sc-authority-discovery = '0.9.0'
-sc-basic-authorship = '0.9.0'
-sc-cli = {features = ['wasmtime'], version = '0.9.0'}
-sc-client-api = '3.0.0'
-sc-client-db = '0.9.0'
-sc-chain-spec = "3.0.0"
-sc-consensus = '0.9.0'
-sc-consensus-babe = '0.9.0'
-sc-consensus-babe-rpc = '0.9.0'
-sc-consensus-epochs = '0.9.0'
-sc-consensus-slots = '0.9.0'
-sc-consensus-uncles = '0.9.0'
-sc-executor = {features = ['wasmtime'], version = '0.9.0'}
-sc-finality-grandpa = '=0.9.0'
-sc-finality-grandpa-rpc = '=0.9.0'
-sc-network = '0.9.0'
-sc-rpc = '3.0.0'
-sc-rpc-api = '0.9.0'
-sc-service = '0.9.0'
-sc-telemetry = '3.0.0'
-sc-transaction-pool = '3.0.0'
-sp-api = '3.0.0'
-sp-authorship = "3.0.0"
-sp-authority-discovery = '3.0.0'
-sp-block-builder = '3.0.0'
-sp-blockchain = '3.0.0'
-sp-consensus = '0.9.0'
-sp-consensus-babe = '0.9.0'
-sp-core = '=3.0.0'
-sp-finality-grandpa = '3.0.0'
-sp-inherents = '3.0.0'
-sp-keystore = '0.9.0'
-sp-runtime = '3.0.0'
-sp-timestamp = '3.0.0'
-sp-transaction-pool = '3.0.0'
-substrate-frame-rpc-system = '3.0.0'
-sp-storage = "3.0.0"
-sp-session = "3.0.0"
-sp-offchain = "3.0.0"
-sp-trie = "3.0.0"
-pallet-transaction-payment-rpc-runtime-api = "3.0.0"
-frame-system-rpc-runtime-api = "3.0.0"
-pallet-grandpa = "3.0.0"
+frame-benchmarking = { workspace = true }
+frame-benchmarking-cli = { workspace = true }
+frame-metadata = { workspace = true, features = ["std"] }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+scale-info = { workspace = true, features = ["std"] }
+pallet-transaction-payment-rpc = { workspace = true }
+pallet-currencies-rpc-runtime-api = { workspace = true }
+sc-basic-authorship = { workspace = true }
+sc-block-builder = { workspace = true }
+sc-rpc-api = { workspace = true }
+sc-chain-spec = { workspace = true }
+sc-cli = { workspace = true }
+sc-client-api = { workspace = true }
+sc-consensus = { workspace = true }
+sc-executor = { workspace = true }
+sc-rpc = { workspace = true }
+sc-service = { workspace = true }
+sc-tracing = { workspace = true }
+sc-telemetry = { workspace = true }
+sc-transaction-pool = { workspace = true }
+sc-transaction-pool-api = { workspace = true }
+sp-api = { workspace = true }
+sp-std = { workspace = true }
+sp-block-builder = { workspace = true }
+sp-blockchain = { workspace = true }
+sp-storage = { workspace = true }
+sp-consensus = { workspace = true }
+sp-consensus-aura = { workspace = true }
+sp-core = { workspace = true }
+sp-runtime = { workspace = true }
+sp-timestamp = { workspace = true }
+substrate-frame-rpc-system = { workspace = true }
+sc-network = { workspace = true }
+sc-network-sync = { workspace = true }
+sp-keystore = { workspace = true }
+sp-offchain = { workspace = true }
+sc-offchain = { workspace = true }
+substrate-prometheus-endpoint = { workspace = true }
+substrate-state-trie-migration-rpc = { workspace = true }
+xcm-runtime-apis = { workspace = true }
+
+# Cumulus dependencies
+cumulus-client-cli = { workspace = true }
+cumulus-client-collator = { workspace = true }
+cumulus-client-consensus-aura = { workspace = true }
+cumulus-client-consensus-common = { workspace = true }
+cumulus-client-consensus-proposer = { workspace = true }
+cumulus-client-service = { workspace = true }
+cumulus-primitives-core = { workspace = true }
+cumulus-primitives-parachain-inherent = { workspace = true }
+cumulus-relay-chain-interface = { workspace = true }
+cumulus-test-relay-sproof-builder = { workspace = true }
+
+# Polkadot dependencies
+polkadot-cli = { workspace = true }
+polkadot-primitives = { workspace = true }
+polkadot-service = { workspace = true }
+
+# Frontier
+fc-consensus = { workspace = true }
+fc-db = { workspace = true, features = ["default"] }
+fc-mapping-sync = { workspace = true }
+fc-rpc = { workspace = true }
+fc-rpc-core = { workspace = true }
+fp-rpc = { workspace = true }
+fp-consensus = { workspace = true }
+fp-self-contained = { workspace = true }
+fp-evm = { workspace = true }
+pallet-ethereum = { workspace = true }
+pallet-balances = { workspace = true }
+pallet-evm = { workspace = true }
 
 [features]
-default = [
-  "frame-benchmarking-cli",
-]
 runtime-benchmarks = [
-  'hydra-dx-runtime/runtime-benchmarks',
-  "frame-benchmarking-cli",
+    "hydradx-runtime/runtime-benchmarks",
+    "frame-benchmarking-cli/runtime-benchmarks",
+    "polkadot-service/runtime-benchmarks",
+    "polkadot-cli/runtime-benchmarks",
+]
+try-runtime = [
+    "hydradx-runtime/try-runtime",
 ]

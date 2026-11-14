@@ -1,0 +1,106 @@
+cargo := cargo --config net.git-fetch-with-cli=true
+ifeq ($(shell uname),Darwin)
+    # macOS-specific commands
+    sha256sum := shasum -a 256
+else
+    # Default commands for other systems
+    sha256sum := sha256sum
+endif
+
+# Fail on warnings
+export RUSTFLAGS := -D warnings
+export CXXFLAGS := -include cstdint
+
+.PHONY: build
+build:
+	$(cargo) build --release --locked
+
+.PHONY: build-release
+build-release:
+	$(cargo) build --release --locked --features metadata-hash
+
+.PHONY: check
+check:
+	$(cargo) check --release
+
+.PHONY: build-benchmarks
+build-benchmarks:
+	$(cargo) build --release --features runtime-benchmarks
+
+.PHONY: test
+test:
+	$(cargo) test --locked
+
+.PHONY: test-release
+test-release:
+	$(cargo) test --release --locked
+
+.PHONY: test-benchmarks
+test-benchmarks:
+	$(cargo) test --release --features runtime-benchmarks
+
+.PHONY: coverage
+coverage:
+	$(cargo) tarpaulin --avoid-cfg-tarpaulin --all-features --workspace --locked  --exclude-files node/* --exclude-files runtime/* --exclude-files infrastructure/*  --exclude-files utils/* --exclude-files **/weights.rs --ignore-tests -o Xml -o lcov --timeout 120
+
+.PHONY: clippy
+clippy:
+	$(cargo) clippy --release --locked --all-targets -- -A deprecated
+
+.PHONY: clippy-all
+clippy-all:
+	$(cargo) clippy --release --locked --all-targets --all-features -- -A deprecated
+
+clippatorize:
+	$(cargo) clippy --release --locked --all-targets --all-features --fix -- -A deprecated
+
+.PHONY: format
+format:
+	$(cargo) fmt
+
+.PHONY: try-runtime
+try-runtime:
+	$(cargo) build --release --features try-runtime
+	try-runtime --runtime ./target/release/wbuild/hydradx-runtime/hydradx_runtime.wasm on-runtime-upgrade --blocktime 2000 --checks all live --uri wss://archive.rpc.hydration.cloud
+
+.PHONY: build-docs
+build-docs:
+	$(cargo) doc --release --target-dir ./HydraDX-dev-docs --no-deps
+
+.PHONY: clean
+clean:
+	$(cargo) clean
+
+.PHONY: docker
+docker: build
+	docker build -t hydra-dx .
+	docker tag hydra-dx galacticcouncil/hydra-dx:latest
+
+# Package a pre-built linux/amd64 `hydradx` binary (at target/release/) into an image —
+# no compile, no git fetch. Run e.g. `make docker-amd64 TAG=v399-test`; buildx emits an
+# amd64 manifest even on an arm host.
+DOCKER_IMAGE := galacticcouncil/hydra-dx
+TAG := latest
+
+.PHONY: docker-amd64
+docker-amd64:
+	cd target/release && $(sha256sum) -c hydradx.sha256
+	docker buildx build --platform linux/amd64 -f Dockerfile.binary -t $(DOCKER_IMAGE):$(TAG) --load .
+
+checksum:
+	$(sha256sum) target/release/hydradx > target/release/hydradx.sha256
+	cp runtime/hydradx/target/srtool/release/wbuild/hydradx-runtime/hydradx_runtime.compact.compressed.wasm target/release/
+	$(sha256sum) target/release/hydradx_runtime.compact.compressed.wasm > target/release/hydradx_runtime.compact.compressed.wasm.sha256
+
+release: build srbuild checksum
+
+all: clippy build-benchmarks test-benchmarks test build checksum
+
+chopstics: release
+	npx @acala-network/chopsticks xcm --parachain=launch-configs/chopsticks/hydradx.yml --parachain=launch-configs/chopsticks/assethub.yml
+
+srbuild:
+	docker run --rm --user $(id -u):$(id -g) -v "$(CURDIR):/build" -e PACKAGE=hydradx-runtime -e RUNTIME_DIR=runtime/hydradx -e BUILD_OPTS="--features=metadata-hash" paritytech/srtool:1.88.0 build --app
+
+check-papi-problems: checksum
+	npx @polkadot-api/check-runtime problems wss://rpc.hydradx.cloud --wasm target/release/hydradx_runtime.compact.compressed.wasm

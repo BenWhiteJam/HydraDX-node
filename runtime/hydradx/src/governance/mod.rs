@@ -1,0 +1,328 @@
+// This file is part of https://github.com/galacticcouncil/*
+//
+//                $$$$$$$      Licensed under the Apache License, Version 2.0 (the "License")
+//             $$$$$$$$$$$$$        you may only use this file in compliance with the License
+//          $$$$$$$$$$$$$$$$$$$
+//                      $$$$$$$$$       Copyright (C) 2021-2024  Intergalactic, Limited (GIB)
+//         $$$$$$$$$$$   $$$$$$$$$$                       SPDX-License-Identifier: Apache-2.0
+//      $$$$$$$$$$$$$$$$$$$$$$$$$$
+//   $$$$$$$$$$$$$$$$$$$$$$$        $                      Built with <3 for decentralisation
+//  $$$$$$$$$$$$$$$$$$$        $$$$$$$
+//  $$$$$$$         $$$$$$$$$$$$$$$$$$      Unless required by applicable law or agreed to in
+//   $       $$$$$$$$$$$$$$$$$$$$$$$       writing, software distributed under the License is
+//      $$$$$$$$$$$$$$$$$$$$$$$$$$        distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
+//      $$$$$$$$$   $$$$$$$$$$$         OR CONDITIONS OF ANY KIND, either express or implied.
+//        $$$$$$$$
+//          $$$$$$$$$$$$$$$$$$            See the License for the specific language governing
+//             $$$$$$$$$$$$$                   permissions and limitations under the License.
+//                $$$$$$$
+//                                                                 $$
+//  $$$$$   $$$$$                    $$                       $
+//   $$$     $$$  $$$     $$   $$$$$ $$  $$$ $$$$  $$$$$$$  $$$$  $$$    $$$$$$   $$ $$$$$$
+//   $$$     $$$   $$$   $$  $$$    $$$   $$$  $  $$     $$  $$    $$  $$     $$   $$$   $$$
+//   $$$$$$$$$$$    $$  $$   $$$     $$   $$        $$$$$$$  $$    $$  $$     $$$  $$     $$
+//   $$$     $$$     $$$$    $$$     $$   $$     $$$     $$  $$    $$   $$     $$  $$     $$
+//  $$$$$   $$$$$     $$      $$$$$$$$ $ $$$      $$$$$$$$   $$$  $$$$   $$$$$$$  $$$$   $$$$
+//                  $$$
+
+pub(crate) use pallet_collective as pallet_collective_council;
+
+pub mod origins;
+pub mod tracks;
+
+use super::*;
+use crate::governance::{
+	origins::{
+		EconomicParameters, GeneralAdmin, ReferendumCanceller, ReferendumKiller, Spender, Treasurer, WhitelistedCaller,
+	},
+	tracks::TracksInfo,
+};
+use frame_support::{
+	parameter_types,
+	sp_runtime::Permill,
+	traits::{tokens::UnityAssetBalanceConversion, EitherOf},
+	PalletId,
+};
+use frame_system::{EnsureRoot, EnsureRootWithSuccess};
+use hydradx_traits::evm::MaybeEvmCall;
+use pallet_collective::EnsureProportionAtLeast;
+use pallet_conviction_voting::{AccountVote, Status, VotingHooks};
+use pallet_referenda::ReferendumIndex;
+use primitives::constants::{currency::DOLLARS, time::DAYS};
+use sp_arithmetic::Perbill;
+use sp_core::ConstU32;
+use sp_runtime::traits::IdentityLookup;
+use sp_std::marker::PhantomData;
+
+pub type TechCommitteeMajority = EnsureProportionAtLeast<AccountId, TechnicalCollective, 1, 2>;
+pub type TechCommitteeSuperMajority = EnsureProportionAtLeast<AccountId, TechnicalCollective, 2, 3>;
+
+parameter_types! {
+	pub const TechnicalMaxProposals: u32 = 20;
+	pub const TechnicalMaxMembers: u32 = 10;
+	pub const TechnicalMotionDuration: BlockNumber = 5 * DAYS;
+  pub MaxProposalWeight: Weight = Perbill::from_percent(50) * BlockWeights::get().max_block;
+}
+
+pub type TechnicalCollective = pallet_collective::Instance2;
+pub(crate) use pallet_collective as pallet_collective_technical_committee;
+
+impl pallet_collective_technical_committee::Config<TechnicalCollective> for Runtime {
+	type RuntimeOrigin = RuntimeOrigin;
+	type Proposal = RuntimeCall;
+	type RuntimeEvent = RuntimeEvent;
+	type MotionDuration = TechnicalMotionDuration;
+	type MaxProposals = TechnicalMaxProposals;
+	type MaxMembers = TechnicalMaxMembers;
+	type DefaultVote = pallet_collective::PrimeDefaultVote;
+	type WeightInfo = weights::pallet_collective_technical_committee::HydraWeight<Runtime>;
+	type MaxProposalWeight = MaxProposalWeight;
+	type SetMembersOrigin = EitherOf<EnsureRoot<Self::AccountId>, GeneralAdmin>;
+	type DisapproveOrigin = EitherOf<EnsureRoot<Self::AccountId>, GeneralAdmin>;
+	type KillOrigin = EitherOf<EnsureRoot<Self::AccountId>, GeneralAdmin>;
+	type Consideration = ();
+}
+
+parameter_types! {
+	pub TreasuryAccount: AccountId = Treasury::account_id();
+	pub const ProposalBond: Permill = Permill::from_percent(3);
+	pub const ProposalBondMinimum: Balance = 100 * DOLLARS;
+	pub const ProposalBondMaximum: Balance = 500 * DOLLARS;
+	pub const SpendPeriod: BlockNumber = DAYS;
+	pub const Burn: Permill = Permill::from_percent(0);
+	pub const TreasuryPalletId: PalletId = PalletId(*b"py/trsry");
+	pub const MaxApprovals: u32 =  100;
+	pub const TreasuryPayoutPeriod: u32 = 30 * DAYS;
+}
+
+pub struct PayFromTreasuryAccount;
+
+impl frame_support::traits::tokens::Pay for PayFromTreasuryAccount {
+	type Balance = Balance;
+	type Beneficiary = AccountId;
+	type AssetKind = ();
+	type Id = ();
+	type Error = sp_runtime::DispatchError;
+
+	#[cfg(not(feature = "runtime-benchmarks"))]
+	fn pay(
+		who: &Self::Beneficiary,
+		_asset_kind: Self::AssetKind,
+		amount: Self::Balance,
+	) -> Result<Self::Id, Self::Error> {
+		let _ = <Balances as frame_support::traits::fungible::Mutate<_>>::transfer(
+			&TreasuryAccount::get(),
+			who,
+			amount,
+			frame_support::traits::tokens::Preservation::Expendable,
+		)?;
+		Ok(())
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn pay(
+		who: &Self::Beneficiary,
+		_asset_kind: Self::AssetKind,
+		amount: Self::Balance,
+	) -> Result<Self::Id, Self::Error> {
+		// In case of benchmarks, we adjust the value by multiplying it by 1_000_000_000_000, otherwise it fails with BelowMinimum limit error, because
+		// treasury benchmarks uses only 100 as the amount.
+		let _ = <Balances as frame_support::traits::fungible::Mutate<_>>::transfer(
+			&TreasuryAccount::get(),
+			who,
+			amount * 1_000_000_000_000,
+			frame_support::traits::tokens::Preservation::Expendable,
+		)?;
+		Ok(())
+	}
+
+	fn check_payment(_id: Self::Id) -> frame_support::traits::tokens::PaymentStatus {
+		frame_support::traits::tokens::PaymentStatus::Success
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn ensure_successful(_: &Self::Beneficiary, _: Self::AssetKind, amount: Self::Balance) {
+		<Balances as frame_support::traits::fungible::Mutate<_>>::mint_into(
+			&TreasuryAccount::get(),
+			amount * 1_000_000_000_000,
+		)
+		.unwrap();
+	}
+	#[cfg(feature = "runtime-benchmarks")]
+	fn ensure_concluded(_: Self::Id) {}
+}
+
+impl pallet_treasury::Config for Runtime {
+	type Currency = Balances;
+	type RejectOrigin = EitherOf<EnsureRoot<AccountId>, Treasurer>;
+	type RuntimeEvent = RuntimeEvent;
+	type SpendPeriod = SpendPeriod;
+	type Burn = Burn;
+	type PalletId = TreasuryPalletId;
+	type BurnDestination = ();
+	type WeightInfo = weights::pallet_treasury::HydraWeight<Runtime>;
+	type SpendFunds = ();
+	type MaxApprovals = MaxApprovals;
+	#[cfg(not(feature = "runtime-benchmarks"))]
+	type SpendOrigin = TreasurySpender;
+	#[cfg(feature = "runtime-benchmarks")]
+	type SpendOrigin =
+		frame_system::EnsureWithSuccess<EnsureRoot<AccountId>, AccountId, crate::benches::BenchmarkMaxBalance>;
+	type AssetKind = (); // set to () to support only the native currency
+	type Beneficiary = AccountId;
+	type BeneficiaryLookup = IdentityLookup<AccountId>;
+	type Paymaster = PayFromTreasuryAccount;
+	type BalanceConverter = UnityAssetBalanceConversion;
+	type PayoutPeriod = TreasuryPayoutPeriod;
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = (); // default impl is enough because we support only the native currency
+	type BlockNumberProvider = System;
+}
+
+parameter_types! {
+	pub const VoteLockingPeriod: BlockNumber = 7 * DAYS;
+	#[derive(Debug)]
+	pub const MaxVotes: u32 = 25;
+}
+
+/// Tuple adapter for `pallet_conviction_voting::VotingHooks` so the runtime
+/// can wire two consumers (staking + gigahdx rewards) into the single hook
+/// slot. The upstream trait does not provide a tuple impl.
+pub struct CombinedVotingHooks<A, B>(PhantomData<(A, B)>);
+
+impl<A, B, AccountId, Balance> VotingHooks<AccountId, ReferendumIndex, Balance> for CombinedVotingHooks<A, B>
+where
+	A: VotingHooks<AccountId, ReferendumIndex, Balance>,
+	B: VotingHooks<AccountId, ReferendumIndex, Balance>,
+	Balance: sp_std::cmp::PartialOrd + Clone,
+{
+	fn on_before_vote(
+		who: &AccountId,
+		idx: ReferendumIndex,
+		vote: AccountVote<Balance>,
+	) -> frame_support::dispatch::DispatchResult {
+		A::on_before_vote(who, idx, vote.clone())?;
+		B::on_before_vote(who, idx, vote)
+	}
+
+	fn on_remove_vote(who: &AccountId, idx: ReferendumIndex, status: Status) {
+		A::on_remove_vote(who, idx, status);
+		B::on_remove_vote(who, idx, status);
+	}
+
+	fn lock_balance_on_unsuccessful_vote(who: &AccountId, idx: ReferendumIndex) -> Option<Balance> {
+		// Combine conservatively: max if both ask for a lock, otherwise
+		// pass through whichever side answered.
+		match (
+			A::lock_balance_on_unsuccessful_vote(who, idx),
+			B::lock_balance_on_unsuccessful_vote(who, idx),
+		) {
+			(Some(a), Some(b)) => Some(if a > b { a } else { b }),
+			(a, b) => a.or(b),
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn on_vote_worst_case(who: &AccountId) {
+		A::on_vote_worst_case(who);
+		B::on_vote_worst_case(who);
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn on_remove_vote_worst_case(who: &AccountId) {
+		A::on_remove_vote_worst_case(who);
+		B::on_remove_vote_worst_case(who);
+	}
+}
+
+impl pallet_conviction_voting::Config for Runtime {
+	type WeightInfo = weights::pallet_conviction_voting::HydraWeight<Runtime>;
+	type RuntimeEvent = RuntimeEvent;
+	type Currency = Balances;
+	type VoteLockingPeriod = VoteLockingPeriod;
+	type MaxVotes = MaxVotes;
+	type MaxTurnout = frame_support::traits::tokens::currency::ActiveIssuanceOf<Balances, Self::AccountId>;
+	type Polls = Referenda;
+	type VotingHooks = CombinedVotingHooks<
+		pallet_staking::integrations::conviction_voting::StakingConvictionVoting<Runtime>,
+		pallet_gigahdx_rewards::voting_hooks::VotingHooksImpl<Runtime>,
+	>;
+	// Any single technical committee member may remove a vote.
+	type VoteRemovalOrigin = frame_system::EnsureSignedBy<TechCommAccounts, AccountId>;
+	type BlockNumberProvider = System;
+}
+
+parameter_types! {
+	pub const MaxBalance: Balance = Balance::MAX;
+}
+pub type TreasurySpender = EitherOf<EnsureRootWithSuccess<AccountId, MaxBalance>, Spender>;
+
+impl pallet_whitelist::Config for Runtime {
+	type WeightInfo = weights::pallet_whitelist::HydraWeight<Runtime>;
+	type RuntimeCall = RuntimeCall;
+	type RuntimeEvent = RuntimeEvent;
+	type WhitelistOrigin = EitherOf<EnsureRoot<Self::AccountId>, TechCommitteeMajority>;
+	type DispatchWhitelistedOrigin = EitherOf<EnsureRoot<Self::AccountId>, WhitelistedCaller>;
+	type Preimages = Preimage;
+}
+
+parameter_types! {
+	pub const AlarmInterval: BlockNumber = 1;
+	pub const SubmissionDeposit: Balance = DOLLARS;
+	pub const UndecidingTimeout: BlockNumber = 2 * DAYS;
+}
+
+impl pallet_referenda::Config for Runtime {
+	type WeightInfo = weights::pallet_referenda::HydraWeight<Runtime>;
+	type RuntimeCall = RuntimeCall;
+	type RuntimeEvent = RuntimeEvent;
+	type Scheduler = Scheduler;
+	type Currency = Balances;
+	type SubmitOrigin = frame_system::EnsureSigned<AccountId>;
+	type CancelOrigin = EitherOf<EnsureRoot<AccountId>, ReferendumCanceller>;
+	type KillOrigin = EitherOf<EnsureRoot<AccountId>, ReferendumKiller>;
+	type Slash = Treasury;
+	type Votes = pallet_conviction_voting::VotesOf<Runtime>;
+	type Tally = pallet_conviction_voting::TallyOf<Runtime>;
+	type SubmissionDeposit = SubmissionDeposit;
+	type MaxQueued = ConstU32<100>;
+	type UndecidingTimeout = UndecidingTimeout;
+	type AlarmInterval = AlarmInterval;
+	type Tracks = TracksInfo;
+	type Preimages = Preimage;
+	type BlockNumberProvider = System;
+}
+
+impl origins::pallet_custom_origins::Config for Runtime {}
+
+parameter_types! {
+	pub const AaveManagerAccount: AccountId = AccountId::new(hex!("aa7e0000000000000000000000000000000aa7e0000000000000000000000000"));
+	pub const EmergencyAdminAccount: AccountId = AccountId::new(hex!("aa7e0000000000000000000000000000000aa7e1000000000000000000000000"));
+}
+
+pub struct EvmCallChecker;
+impl MaybeEvmCall<RuntimeCall> for EvmCallChecker {
+	#[cfg(not(feature = "runtime-benchmarks"))]
+	fn is_evm_call(call: &RuntimeCall) -> bool {
+		matches!(call, RuntimeCall::EVM(pallet_evm::Call::call { .. }))
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn is_evm_call(_call: &RuntimeCall) -> bool {
+		true
+	}
+}
+
+impl pallet_dispatcher::Config for Runtime {
+	type RuntimeCall = RuntimeCall;
+	type EvmCallIdentifier = EvmCallChecker;
+	type TreasuryManagerOrigin = EitherOf<EnsureRoot<AccountId>, Treasurer>;
+	type AaveManagerOrigin = EitherOf<EnsureRoot<AccountId>, EconomicParameters>;
+	type EmergencyAdminOrigin = EitherOf<EnsureRoot<AccountId>, TechCommitteeMajority>;
+	type TreasuryAccount = TreasuryAccount;
+	type DefaultAaveManagerAccount = AaveManagerAccount;
+	type EmergencyAdminAccount = EmergencyAdminAccount;
+	type GasWeightMapping = evm::FixedHydraGasWeightMapping<Runtime>;
+	type EvmFeePayer = evm::EvmFeePayerImpl;
+	type WeightInfo = weights::pallet_dispatcher::HydraWeight<Runtime>;
+}

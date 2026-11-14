@@ -1,0 +1,499 @@
+[package]
+name = "hydradx-runtime"
+version = "458.0.0"
+authors = ["GalacticCouncil"]
+edition = "2021"
+license = "Apache 2.0"
+repository = "https://github.com/galacticcouncil/HydraDX-node"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[build-dependencies]
+substrate-wasm-builder = { workspace = true }
+
+[dependencies]
+hex-literal = { workspace = true }
+serde = { workspace = true, optional = true }
+codec = { workspace = true }
+scale-info = { workspace = true }
+smallvec = { workspace = true }
+log = { workspace = true }
+num_enum = { workspace = true, default-features = false }
+evm = { workspace = true, features = ["with-codec"] }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+
+route-findr = {workspace = true}
+
+# local dependencies
+primitives = { workspace = true }
+hydradx-adapters = { workspace = true }
+hydradx-traits = { workspace = true }
+pallet-claims = { workspace = true }
+pallet-genesis-history = { workspace = true }
+pallet-omnipool = { workspace = true }
+pallet-circuit-breaker = { workspace = true }
+pallet-omnipool-liquidity-mining = { workspace = true }
+pallet-dca = { workspace = true }
+hydra-dx-math = { workspace = true }
+pallet-dynamic-fees = { workspace = true }
+pallet-dynamic-evm-fee = { workspace = true }
+pallet-stableswap = { workspace = true }
+pallet-bonds = { workspace = true }
+pallet-lbp = { workspace = true }
+pallet-xyk = { workspace = true }
+pallet-referrals = { workspace = true }
+pallet-fee-processor= { workspace = true }
+pallet-broadcast = { workspace = true }
+pallet-evm-accounts = { workspace = true }
+pallet-evm-accounts-rpc-runtime-api = { workspace = true }
+pallet-xyk-liquidity-mining = { workspace = true }
+pallet-relaychain-info = { workspace = true }
+pallet-transaction-multi-payment = { workspace = true, features = ["evm"] }
+pallet-asset-registry = { workspace = true }
+pallet-collator-rewards = { workspace = true }
+pallet-collator-rotation = { workspace = true }
+pallet-currencies = { workspace = true }
+pallet-currencies-rpc-runtime-api = { workspace = true }
+pallet-ema-oracle = { workspace = true }
+pallet-transaction-pause = { workspace = true }
+pallet-duster = { workspace = true }
+pallet-duster-rpc-runtime-api = { workspace = true }
+warehouse-liquidity-mining = { workspace = true }
+pallet-otc = { workspace = true }
+pallet-otc-settlements = { workspace = true }
+pallet-route-executor = { workspace = true }
+pallet-staking = { workspace = true }
+pallet-liquidation = { workspace = true }
+pallet-hsm = { workspace = true }
+pallet-parameters = { workspace = true }
+pallet-intent = { workspace = true }
+pallet-ice = { workspace = true }
+pallet-ice-runtime-api = { workspace = true }
+pallet-lazy-executor = { workspace = true }
+amm-simulator = { workspace = true }
+ice-support = { workspace = true }
+
+# pallets
+pallet-bags-list = { workspace = true }
+pallet-balances = { workspace = true }
+pallet-conviction-voting = { workspace = true }
+pallet-dispatcher = { workspace = true }
+pallet-transaction-payment = { workspace = true }
+pallet-transaction-payment-rpc-runtime-api = { workspace = true }
+pallet-treasury = { workspace = true }
+pallet-utility = { workspace = true }
+pallet-aura = { workspace = true }
+pallet-session = { workspace = true }
+pallet-timestamp = { workspace = true }
+pallet-preimage = { workspace = true }
+pallet-scheduler = { workspace = true }
+pallet-identity = { workspace = true }
+pallet-collective = { workspace = true }
+pallet-tips = { workspace = true }
+pallet-proxy = { workspace = true }
+pallet-migrations = { workspace = true }
+pallet-multisig = { workspace = true }
+pallet-referenda = { workspace = true }
+pallet-elections-phragmen = { workspace = true }
+pallet-uniques = { workspace = true }
+pallet-whitelist = { workspace = true }
+pallet-message-queue = { workspace = true }
+pallet-state-trie-migration = { workspace = true }
+pallet-signet = { workspace = true }
+pallet-dispenser = { workspace = true }
+
+# ORML dependencies
+orml-tokens = { workspace = true }
+orml-traits = { workspace = true }
+orml-vesting = { workspace = true }
+orml-benchmarking = { workspace = true, optional = true }
+
+# orml XCM support
+orml-xtokens = { workspace = true }
+orml-xcm-support = { workspace = true }
+orml-unknown-tokens = { workspace = true }
+orml-xcm = { workspace = true }
+
+# collator support
+pallet-collator-selection = { workspace = true }
+pallet-authorship = { workspace = true }
+
+# Cumulus dependencies
+cumulus-pallet-aura-ext = { workspace = true }
+cumulus-pallet-parachain-system = { workspace = true }
+cumulus-pallet-weight-reclaim = { workspace = true }
+cumulus-pallet-xcm = { workspace = true }
+cumulus-pallet-xcmp-queue = { workspace = true }
+cumulus-primitives-aura = { workspace = true }
+cumulus-primitives-core = { workspace = true }
+cumulus-primitives-utility = { workspace = true }
+cumulus-primitives-parachain-inherent = { workspace = true }
+cumulus-primitives-storage-weight-reclaim = { workspace = true }
+cumulus-primitives-timestamp = { workspace = true }
+staging-parachain-info = { workspace = true }
+parachains-common = { workspace = true }
+
+# Polkadot dependencies
+polkadot-parachain = { workspace = true }
+pallet-xcm = { workspace = true }
+pallet-xcm-benchmarks = { workspace = true, optional = true }
+polkadot-xcm = { workspace = true }
+xcm-executor = { workspace = true }
+xcm-builder = { workspace = true }
+polkadot-runtime-common = { workspace = true }
+xcm-runtime-apis = { workspace = true }
+
+# Substrate dependencies
+frame-benchmarking = { workspace = true, optional = true }
+frame-executive = { workspace = true }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+frame-system-benchmarking = { workspace = true, optional = true }
+frame-system-rpc-runtime-api = { workspace = true }
+frame-try-runtime = { workspace = true, optional = true }
+frame-metadata-hash-extension = { workspace = true }
+sp-api = { workspace = true }
+sp-arithmetic = { workspace = true }
+sp-block-builder = { workspace = true }
+sp-genesis-builder = { workspace = true }
+sp-consensus-aura = { workspace = true }
+sp-core = { workspace = true }
+sp-inherents = { workspace = true }
+sp-externalities = { workspace = true }
+sp-offchain = { workspace = true }
+sp-runtime = { workspace = true }
+sp-session = { workspace = true }
+sp-std = { workspace = true }
+sp-staking = { workspace = true }
+sp-transaction-pool = { workspace = true }
+sp-version = { workspace = true }
+sp-trie = { workspace = true }
+sp-io = { workspace = true }
+primitive-types = { workspace = true }
+static_assertions = { workspace = true }
+
+# Frontier
+fp-rpc = { workspace = true }
+fp-evm = { workspace = true }
+fp-self-contained = { workspace = true, features = ["serde"] }
+pallet-ethereum = { workspace = true }
+pallet-evm = { workspace = true }
+pallet-evm-chain-id = { workspace = true }
+pallet-evm-precompile-dispatch = { workspace = true }
+pallet-evm-precompile-simple = { workspace = true }
+pallet-evm-precompile-modexp = { workspace = true }
+pallet-evm-precompile-bn128 = { workspace = true }
+pallet-evm-precompile-blake2 = { workspace = true }
+pallet-evm-precompile-call-permit = { workspace = true }
+pallet-evm-precompile-flash-loan = { workspace = true }
+pallet-evm-precompile-lock-manager = { workspace = true }
+pallet-gigahdx = { workspace = true }
+pallet-gigahdx-rewards = { workspace = true }
+precompile-utils = { workspace = true }
+module-evm-utility-macro = { workspace = true }
+ethabi = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true, default-features = false, features = [
+    "alloc",
+] }
+ethereum = { workspace = true }
+ethereum-types = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[features]
+default = ["std"]
+runtime-benchmarks = [
+    "frame-benchmarking",
+    "frame-support/runtime-benchmarks",
+    "frame-system-benchmarking/runtime-benchmarks",
+    "frame-system/runtime-benchmarks",
+    "orml-benchmarking",
+    "hydradx-adapters/runtime-benchmarks",
+    "pallet-xcm/runtime-benchmarks",
+    "xcm-builder/runtime-benchmarks",
+    "pallet-balances/runtime-benchmarks",
+    "pallet-collator-selection/runtime-benchmarks",
+    "pallet-timestamp/runtime-benchmarks",
+    "pallet-treasury/runtime-benchmarks",
+    "pallet-preimage/runtime-benchmarks",
+    "pallet-scheduler/runtime-benchmarks",
+    "pallet-claims/runtime-benchmarks",
+    "pallet-identity/runtime-benchmarks",
+    "pallet-collective/runtime-benchmarks",
+    "pallet-transaction-pause/runtime-benchmarks",
+    "pallet-tips/runtime-benchmarks",
+    "pallet-proxy/runtime-benchmarks",
+    "pallet-migrations/runtime-benchmarks",
+    "pallet-multisig/runtime-benchmarks",
+    "pallet-utility/runtime-benchmarks",
+    "pallet-asset-registry/runtime-benchmarks",
+    "sp-runtime/runtime-benchmarks",
+    "cumulus-pallet-parachain-system/runtime-benchmarks",
+    "cumulus-pallet-xcmp-queue/runtime-benchmarks",
+    "pallet-uniques/runtime-benchmarks",
+    "pallet-omnipool/runtime-benchmarks",
+    "pallet-circuit-breaker/runtime-benchmarks",
+    "pallet-ema-oracle/runtime-benchmarks",
+    "pallet-duster/runtime-benchmarks",
+    "pallet-omnipool-liquidity-mining/runtime-benchmarks",
+    "pallet-otc/runtime-benchmarks",
+    "pallet-otc-settlements/runtime-benchmarks",
+    "pallet-dca/runtime-benchmarks",
+    "pallet-route-executor/runtime-benchmarks",
+    "pallet-ethereum/runtime-benchmarks",
+    "pallet-evm/runtime-benchmarks",
+    "pallet-staking/runtime-benchmarks",
+    "pallet-bonds/runtime-benchmarks",
+    "pallet-stableswap/runtime-benchmarks",
+    "pallet-lbp/runtime-benchmarks",
+    "pallet-xyk/runtime-benchmarks",
+    "pallet-hsm/runtime-benchmarks",
+    "pallet-elections-phragmen/runtime-benchmarks",
+    "pallet-referrals/runtime-benchmarks",
+    "pallet-fee-processor/runtime-benchmarks",
+    "pallet-transaction-multi-payment/runtime-benchmarks",
+    "pallet-evm-accounts/runtime-benchmarks",
+    "pallet-message-queue/runtime-benchmarks",
+    "pallet-state-trie-migration/runtime-benchmarks",
+    "xcm-runtime-apis/runtime-benchmarks",
+    "pallet-liquidation/runtime-benchmarks",
+    "pallet-conviction-voting/runtime-benchmarks",
+    "pallet-referenda/runtime-benchmarks",
+    "pallet-whitelist/runtime-benchmarks",
+    "pallet-dispatcher/runtime-benchmarks",
+    "cumulus-primitives-utility/runtime-benchmarks",
+    "pallet-xcm-benchmarks/runtime-benchmarks",
+    "pallet-signet/runtime-benchmarks",
+    "pallet-dispenser/runtime-benchmarks",
+    "pallet-gigahdx/runtime-benchmarks",
+    "pallet-gigahdx-rewards/runtime-benchmarks",
+    "cumulus-pallet-weight-reclaim/runtime-benchmarks",
+]
+std = [
+    "codec/std",
+    "serde",
+    "scale-info/std",
+    "frame-executive/std",
+    "frame-support/std",
+    "frame-system/std",
+    "frame-system-rpc-runtime-api/std",
+    "frame-try-runtime/std",
+    "frame-metadata-hash-extension/std",
+    "cumulus-pallet-parachain-system/std",
+    "cumulus-pallet-aura-ext/std",
+    "cumulus-primitives-aura/std",
+    "cumulus-primitives-core/std",
+    "cumulus-primitives-utility/std",
+    "cumulus-primitives-storage-weight-reclaim/std",
+    "cumulus-pallet-xcm/std",
+    "cumulus-pallet-xcmp-queue/std",
+    "staging-parachain-info/std",
+    "pallet-xcm/std",
+    "pallet-xcm-benchmarks?/std",
+    "polkadot-xcm/std",
+    "xcm-runtime-apis/std",
+    "xcm-executor/std",
+    "xcm-builder/std",
+    "orml-tokens/std",
+    "orml-traits/std",
+    "orml-vesting/std",
+    "orml-xtokens/std",
+    "orml-xcm-support/std",
+    "orml-xcm/std",
+    "orml-unknown-tokens/std",
+    "orml-benchmarking/std",
+    "pallet-aura/std",
+    "pallet-balances/std",
+    "pallet-session/std",
+    "pallet-timestamp/std",
+    "pallet-preimage/std",
+    "pallet-scheduler/std",
+    "pallet-identity/std",
+    "pallet-collective/std",
+    "pallet-tips/std",
+    "pallet-proxy/std",
+    "pallet-migrations/std",
+    "pallet-multisig/std",
+    "pallet-transaction-payment/std",
+    "pallet-transaction-payment-rpc-runtime-api/std",
+    "pallet-elections-phragmen/std",
+    "pallet-claims/std",
+    "pallet-treasury/std",
+    "pallet-collator-selection/std",
+    "pallet-collator-rotation/std",
+    "pallet-authorship/std",
+    "pallet-utility/std",
+    "pallet-uniques/std",
+    "hydradx-adapters/std",
+    "hydradx-traits/std",
+    "pallet-transaction-multi-payment/std",
+    "pallet-genesis-history/std",
+    "pallet-asset-registry/std",
+    "pallet-currencies/std",
+    "pallet-currencies-rpc-runtime-api/std",
+    "pallet-omnipool/std",
+    "pallet-circuit-breaker/std",
+    "pallet-transaction-pause/std",
+    "pallet-dca/std",
+    "pallet-ema-oracle/std",
+    "pallet-otc/std",
+    "pallet-otc-settlements/std",
+    "pallet-route-executor/std",
+    "pallet-omnipool-liquidity-mining/std",
+    "pallet-dynamic-fees/std",
+    "pallet-staking/std",
+    "pallet-bonds/std",
+    "pallet-stableswap/std",
+    "pallet-lbp/std",
+    "pallet-xyk/std",
+    "pallet-duster/std",
+    "pallet-duster-rpc-runtime-api/std",
+    "pallet-hsm/std",
+    "pallet-parameters/std",
+    "warehouse-liquidity-mining/std",
+    "sp-api/std",
+    "sp-arithmetic/std",
+    "sp-block-builder/std",
+    "sp-genesis-builder/std",
+    "sp-consensus-aura/std",
+    "sp-core/std",
+    "sp-io/std",
+    "sp-inherents/std",
+    "sp-externalities/std",
+    "sp-offchain/std",
+    "sp-runtime/std",
+    "sp-session/std",
+    "sp-std/std",
+    "sp-trie/std",
+    "sp-transaction-pool/std",
+    "sp-version/std",
+    "fp-rpc/std",
+    "fp-self-contained/std",
+    "pallet-ethereum/std",
+    "pallet-dynamic-evm-fee/std",
+    "pallet-evm/std",
+    "pallet-evm-chain-id/std",
+    "pallet-evm-precompile-dispatch/std",
+    "pallet-evm-precompile-simple/std",
+    "pallet-evm-precompile-modexp/std",
+    "pallet-evm-precompile-bn128/std",
+    "pallet-evm-precompile-blake2/std",
+    "pallet-evm-precompile-call-permit/std",
+    "pallet-evm-precompile-flash-loan/std",
+    "pallet-evm-precompile-lock-manager/std",
+    "pallet-gigahdx/std",
+    "pallet-gigahdx-rewards/std",
+    "pallet-xyk/std",
+    "pallet-referrals/std",
+    "pallet-fee-processor/std",
+    "pallet-evm-accounts/std",
+    "pallet-evm-accounts-rpc-runtime-api/std",
+    "pallet-xyk-liquidity-mining/std",
+    "parachains-common/std",
+    "polkadot-runtime-common/std",
+    "pallet-state-trie-migration/std",
+    "pallet-liquidation/std",
+    "pallet-conviction-voting/std",
+    "pallet-referenda/std",
+    "pallet-whitelist/std",
+    "pallet-broadcast/std",
+    "pallet-dispatcher/std",
+    "pallet-signet/std",
+    "pallet-dispenser/std",
+    "pallet-intent/std",
+    "pallet-ice/std",
+    "pallet-ice-runtime-api/std",
+    "pallet-lazy-executor/std",
+    "amm-simulator/std",
+    "ice-support/std",
+    "route-findr/std",
+]
+try-runtime = [
+    "frame-try-runtime",
+    "frame-executive/try-runtime",
+    "frame-system/try-runtime",
+    "pallet-currencies/try-runtime",
+    "orml-tokens/try-runtime",
+    "orml-vesting/try-runtime",
+    "orml-xtokens/try-runtime",
+    "orml-xcm/try-runtime",
+    "orml-unknown-tokens/try-runtime",
+    "cumulus-pallet-parachain-system/try-runtime",
+    "cumulus-pallet-aura-ext/try-runtime",
+    "cumulus-pallet-xcm/try-runtime",
+    "cumulus-pallet-xcmp-queue/try-runtime",
+    "staging-parachain-info/try-runtime",
+    "pallet-aura/try-runtime",
+    "pallet-bags-list/try-runtime",
+    "pallet-balances/try-runtime",
+    "pallet-elections-phragmen/try-runtime",
+    "pallet-session/try-runtime",
+    "pallet-timestamp/try-runtime",
+    "pallet-transaction-payment/try-runtime",
+    "pallet-transaction-pause/try-runtime",
+    "pallet-ema-oracle/try-runtime",
+    "pallet-utility/try-runtime",
+    "pallet-treasury/try-runtime",
+    "pallet-collective/try-runtime",
+    "pallet-proxy/try-runtime",
+    "pallet-migrations/try-runtime",
+    "pallet-multisig/try-runtime",
+    "pallet-scheduler/try-runtime",
+    "pallet-tips/try-runtime",
+    "pallet-collator-selection/try-runtime",
+    "pallet-authorship/try-runtime",
+    "pallet-uniques/try-runtime",
+    "pallet-preimage/try-runtime",
+    "pallet-identity/try-runtime",
+    "pallet-xcm/try-runtime",
+    "pallet-asset-registry/try-runtime",
+    "pallet-transaction-multi-payment/try-runtime",
+    "pallet-relaychain-info/try-runtime",
+    "pallet-omnipool/try-runtime",
+    "pallet-dca/try-runtime",
+    "pallet-collator-rewards/try-runtime",
+    "pallet-collator-rotation/try-runtime",
+    "pallet-genesis-history/try-runtime",
+    "pallet-claims/try-runtime",
+    "pallet-duster/try-runtime",
+    "warehouse-liquidity-mining/try-runtime",
+    "pallet-omnipool-liquidity-mining/try-runtime",
+    "pallet-circuit-breaker/try-runtime",
+    "pallet-otc/try-runtime",
+    "pallet-otc-settlements/try-runtime",
+    "pallet-route-executor/try-runtime",
+    "pallet-dynamic-fees/try-runtime",
+    "pallet-staking/try-runtime",
+    "pallet-bonds/try-runtime",
+    "pallet-stableswap/try-runtime",
+    "pallet-lbp/try-runtime",
+    "pallet-xyk/try-runtime",
+    "fp-self-contained/try-runtime",
+    "pallet-ethereum/try-runtime",
+    "pallet-dynamic-evm-fee/try-runtime",
+    "pallet-evm/try-runtime",
+    "pallet-evm-chain-id/try-runtime",
+    "pallet-xyk/try-runtime",
+    "pallet-hsm/try-runtime",
+    "pallet-referrals/try-runtime",
+    "pallet-fee-processor/try-runtime",
+    "pallet-evm-accounts/try-runtime",
+    "pallet-xyk-liquidity-mining/try-runtime",
+    "pallet-message-queue/try-runtime",
+    "pallet-state-trie-migration/try-runtime",
+    "pallet-liquidation/try-runtime",
+    "pallet-conviction-voting/try-runtime",
+    "pallet-referenda/try-runtime",
+    "pallet-whitelist/try-runtime",
+    "pallet-broadcast/try-runtime",
+    "pallet-dispatcher/try-runtime",
+    "pallet-signet/try-runtime",
+]
+
+metadata-hash = [
+    "substrate-wasm-builder/metadata-hash",
+]

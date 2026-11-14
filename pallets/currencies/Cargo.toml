@@ -1,0 +1,52 @@
+[package]
+name = "pallet-currencies"
+description = "Provide `MultiCurrency` implementation using `pallet-balances` and `orml-tokens` module."
+repository = "https://github.com/open-web3-stack/open-runtime-module-library/tree/master/currencies"
+license = "Apache-2.0"
+version = "4.2.0"
+authors = ["Laminar Developers <hello@laminar.one>"]
+edition = "2021"
+
+[dependencies]
+scale-info = { workspace = true }
+serde = { workspace = true, optional = true }
+codec = { workspace = true }
+
+hydradx-traits = { workspace = true }
+primitives = { workspace = true }
+
+sp-runtime = { workspace = true }
+sp-core = { workspace = true }
+sp-io = { workspace = true }
+sp-std = { workspace = true }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+
+orml-traits = { workspace = true }
+orml-utilities = { workspace = true }
+
+[dev-dependencies]
+sp-core = { workspace = true }
+pallet-balances = { workspace = true }
+orml-tokens = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "serde",
+    "codec/std",
+    "scale-info/std",
+    "sp-runtime/std",
+    "sp-core/std",
+    "sp-std/std",
+    "sp-io/std",
+    "hydradx-traits/std",
+    "primitives/std",
+    "frame-support/std",
+    "frame-system/std",
+    "pallet-balances/std",
+    "orml-traits/std",
+    "orml-tokens/std",
+    "orml-utilities/std",
+]
+try-runtime = ["frame-support/try-runtime"]

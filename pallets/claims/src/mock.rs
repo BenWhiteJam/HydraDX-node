@@ -15,32 +15,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::*;
 use crate as claims;
 use crate::{Config, EthereumAddress};
 use frame_support::parameter_types;
-use frame_system;
 use hex_literal::hex;
 use primitives::Balance;
 use sp_core::H256;
 use sp_runtime::{
-	testing::Header,
 	traits::{BlakeTwo256, IdentityLookup},
+	BuildStorage,
 };
 
-use frame_support::traits::GenesisBuild;
+use frame_support::traits::Everything;
 
-type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<Test>;
 type Block = frame_system::mocking::MockBlock<Test>;
 
 frame_support::construct_runtime!(
-	pub enum Test where
-	 Block = Block,
-	 NodeBlock = Block,
-	 UncheckedExtrinsic = UncheckedExtrinsic,
+	pub enum Test
 	 {
-		 System: frame_system::{Pallet, Call, Config, Storage, Event<T>},
-		 ClaimsPallet: claims::{Pallet, Call, Storage, Event<T>},
-		 Balances: pallet_balances::{Pallet, Event<T>},
+		 System: frame_system,
+		 ClaimsPallet: claims,
+		 Balances: pallet_balances,
 	 }
 );
 
@@ -49,19 +45,19 @@ parameter_types! {
 }
 
 impl frame_system::Config for Test {
-	type BaseCallFilter = ();
+	type BaseCallFilter = Everything;
 	type BlockWeights = ();
 	type BlockLength = ();
-	type Origin = Origin;
-	type Call = Call;
-	type Index = u64;
-	type BlockNumber = u64;
+	type RuntimeOrigin = RuntimeOrigin;
+	type RuntimeCall = RuntimeCall;
+	type RuntimeTask = RuntimeTask;
+	type Nonce = u64;
+	type Block = Block;
 	type Hash = H256;
 	type Hashing = BlakeTwo256;
 	type AccountId = AccountId;
 	type Lookup = IdentityLookup<Self::AccountId>;
-	type Header = Header;
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type BlockHashCount = BlockHashCount;
 	type DbWeight = ();
 	type Version = ();
@@ -72,18 +68,34 @@ impl frame_system::Config for Test {
 	type SystemWeightInfo = ();
 	type SS58Prefix = ();
 	type OnSetCode = ();
+	type MaxConsumers = frame_support::traits::ConstU32<16>;
+	type SingleBlockMigrations = ();
+	type MultiBlockMigrator = ();
+	type PreInherents = ();
+	type PostInherents = ();
+	type PostTransactions = ();
+	type ExtensionsWeightInfo = ();
+}
+
+parameter_types! {
+	pub const ExistentialDeposit: Balance = 1;
 }
 
 impl pallet_balances::Config for Test {
 	type MaxLocks = ();
 	type Balance = Balance;
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type DustRemoval = ();
-	type ExistentialDeposit = ();
+	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = frame_system::Pallet<Test>;
 	type WeightInfo = ();
 	type MaxReserves = ();
 	type ReserveIdentifier = ();
+	type FreezeIdentifier = ();
+	type MaxFreezes = ();
+	type RuntimeHoldReason = ();
+	type RuntimeFreezeReason = ();
+	type DoneSlashHandler = ();
 }
 
 parameter_types! {
@@ -91,7 +103,6 @@ parameter_types! {
 }
 
 impl Config for Test {
-	type Event = Event;
 	type Currency = Balances;
 	type Prefix = Prefix;
 	type WeightInfo = ();
@@ -105,15 +116,18 @@ pub const CHARLIE: AccountId = 44;
 
 pub const CLAIM_AMOUNT: Balance = 1_000_000_000_000;
 
+#[derive(Default)]
 pub struct ExtBuilder;
 
 impl ExtBuilder {
 	// builds genesis config
 	pub fn build(self) -> sp_io::TestExternalities {
-		let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+		let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
 
 		pallet_balances::GenesisConfig::<Test> {
-			balances: vec![(42, 0), (43, 0), (44, primitives::Balance::MAX - 1)],
+			//NOTE: total issuance must be less than Balance::MAX
+			balances: vec![(ALICE, 1), (BOB, 1), (CHARLIE, Balance::MAX - 2)],
+			dev_accounts: None,
 		}
 		.assimilate_storage(&mut t)
 		.unwrap();
@@ -130,11 +144,5 @@ impl ExtBuilder {
 		.unwrap();
 
 		t.into()
-	}
-}
-
-impl Default for ExtBuilder {
-	fn default() -> Self {
-		Self {}
 	}
 }

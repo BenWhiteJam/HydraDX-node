@@ -1,6 +1,6 @@
-// This file is part of HydraDX.
+// This file is part of Basilisk-node.
 
-// Copyright (C) 2020-2021  Intergalactic, Limited (GIB).
+// Copyright (C) 2020-2022  Intergalactic, Limited (GIB).
 // SPDX-License-Identifier: Apache-2.0
 
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,10 +17,14 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(clippy::unused_unit)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::manual_inspect)]
+#![allow(clippy::useless_conversion)]
 
 pub mod weights;
 
-use weights::WeightInfo;
+pub use weights::WeightInfo;
 
 #[cfg(test)]
 mod mock;
@@ -29,96 +33,167 @@ mod mock;
 mod tests;
 mod traits;
 
+pub use crate::traits::*;
+use codec::DecodeLimit;
+use frame_support::storage::with_transaction;
+use frame_support::traits::{Contains, ExistenceRequirement, IsSubType};
 use frame_support::{
 	dispatch::DispatchResult,
 	ensure,
-	traits::{Currency, ExistenceRequirement, Get, Imbalance, OnUnbalanced, WithdrawReasons},
-	transactional,
-	weights::DispatchClass,
-	weights::WeightToFeePolynomial,
+	sp_runtime::{
+		traits::{DispatchInfoOf, One, PostDispatchInfoOf, Saturating, Zero},
+		transaction_validity::{InvalidTransaction, TransactionValidityError},
+		FixedPointNumber, FixedPointOperand, FixedU128,
+	},
+	traits::Get,
+	weights::Weight,
 };
-use frame_system::{ensure_root, ensure_signed};
-use sp_runtime::{
-	traits::{DispatchInfoOf, PostDispatchInfoOf, Saturating, Zero},
-	transaction_validity::{InvalidTransaction, TransactionValidityError},
+use frame_system::{ensure_signed, pallet_prelude::BlockNumberFor};
+use hydra_dx_math::ema::EmaPrice;
+use hydradx_traits::circuit_breaker::WithdrawFuseControl;
+use hydradx_traits::{
+	evm::{EvmFeePayerSupport, InspectEvmAccounts},
+	router::{AssetPair, RouteProvider},
+	AccountFeeCurrency, NativePriceOracle, OraclePeriod, PriceOracle,
 };
-use sp_std::prelude::*;
-
+use orml_traits::{GetByKey, Happened, MultiCurrency};
 use pallet_transaction_payment::OnChargeTransaction;
-use sp_std::marker::PhantomData;
+use sp_runtime::traits::TryConvert;
+use sp_std::{marker::PhantomData, prelude::*};
 
-use common_runtime::constants::chain::CORE_ASSET_ID;
-use frame_support::sp_runtime::FixedPointNumber;
-use frame_support::weights::{Pays, Weight};
-use orml_traits::{MultiCurrency, MultiCurrencyExtended};
-use primitives::asset::AssetPair;
-use primitives::traits::AMM;
-use primitives::{Amount, AssetId, Balance};
+pub type AssetIdOf<T> =
+	<<T as Config>::Currencies as MultiCurrency<<T as frame_system::Config>::AccountId>>::CurrencyId;
+type BalanceOf<T> = <<T as Config>::Currencies as MultiCurrency<<T as frame_system::Config>::AccountId>>::Balance;
 
-type NegativeImbalanceOf<C, T> = <C as Currency<<T as frame_system::Config>::AccountId>>::NegativeImbalance;
+/// Spot price type
+pub type Price = FixedU128;
+
+pub const MAX_EVM_CALL_OUTPUT_LEN: u32 = 256;
+
 // Re-export pallet items so that they can be accessed from the crate namespace.
 pub use pallet::*;
 
 #[frame_support::pallet]
 pub mod pallet {
 	use super::*;
+	use fp_evm::ExitReason;
+	use frame_support::dispatch::PostDispatchInfo;
 	use frame_support::pallet_prelude::*;
+	use frame_support::weights::WeightToFee;
+	use frame_system::ensure_none;
 	use frame_system::pallet_prelude::OriginFor;
-	use primitives::Price;
+	use sp_core::{H160, H256, U256};
+	use sp_runtime::{ModuleError, TransactionOutcome};
 
 	#[pallet::pallet]
 	pub struct Pallet<T>(_);
 
 	#[pallet::hooks]
-	impl<T: Config> Hooks<T::BlockNumber> for Pallet<T> {}
+	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
+			let native_asset = T::NativeAssetId::get();
+
+			let mut weight: u64 = 0;
+
+			for (asset_id, fallback_price) in <AcceptedCurrencies<T>>::iter() {
+				let maybe_price = Self::get_oracle_price(asset_id, native_asset);
+
+				let price = maybe_price.unwrap_or(fallback_price);
+
+				AcceptedCurrencyPrice::<T>::insert(asset_id, price);
+
+				weight += <T as pallet::Config>::WeightInfo::get_oracle_price().ref_time();
+			}
+
+			Weight::from_parts(weight, 0)
+		}
+
+		fn on_finalize(_n: BlockNumberFor<T>) {
+			let _ = <AcceptedCurrencyPrice<T>>::clear(u32::MAX, None);
+		}
+	}
 
 	#[pallet::config]
 	pub trait Config: frame_system::Config + pallet_transaction_payment::Config {
-		/// Because this pallet emits events, it depends on the runtime's definition of an event.
-		type Event: From<Event<Self>> + IsType<<Self as frame_system::Config>::Event>;
-
-		/// The currency type in which fees will be paid.
-		type Currency: Currency<Self::AccountId> + Send + Sync;
+		/// The origin which can add/remove accepted currencies
+		type AcceptedCurrencyOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
 		/// Multi Currency
-		type MultiCurrency: MultiCurrency<Self::AccountId>
-			+ MultiCurrencyExtended<Self::AccountId, CurrencyId = AssetId, Balance = Balance, Amount = Amount>;
+		type Currencies: MultiCurrency<Self::AccountId>;
 
-		/// AMM pool to swap for native currency
-		type AMMPool: AMM<Self::AccountId, AssetId, AssetPair, Balance>;
+		/// On chain route provider
+		type RouteProvider: RouteProvider<AssetIdOf<Self>>;
+
+		/// Oracle price provider for routes
+		type OraclePriceProvider: PriceOracle<AssetIdOf<Self>, Price = EmaPrice>;
 
 		/// Weight information for the extrinsics.
 		type WeightInfo: WeightInfo;
 
-		/// Should fee be paid for setting a currency
-		type WithdrawFeeForSetCurrency: Get<Pays>;
-
 		/// Convert a weight value into a deductible fee based on the currency type.
-		type WeightToFee: WeightToFeePolynomial<Balance = Balance>;
+		type WeightToFee: WeightToFee<Balance = BalanceOf<Self>>;
+
+		/// Native Asset
+		#[pallet::constant]
+		type NativeAssetId: Get<AssetIdOf<Self>>;
+
+		/// EVM Asset
+		#[pallet::constant]
+		type EvmAssetId: Get<AssetIdOf<Self>>;
+
+		/// EVM Accounts info
+		type InspectEvmAccounts: InspectEvmAccounts<Self::AccountId>;
+
+		type EvmPermit: EVMPermit;
+
+		/// Try to retrieve fee currency from runtime call.
+		/// It is generic implementation to avoid tight coupling with other pallets such as utility.
+		type TryCallCurrency<'a>: TryConvert<&'a <Self as frame_system::Config>::RuntimeCall, AssetIdOf<Self>>;
+
+		/// EVM fee-payer override; used by the signed branch of `dispatch_permit`
+		/// to charge the paymaster instead of `permit.from`.
+		type EvmFeePayer: EvmFeePayerSupport<AccountId = Self::AccountId>;
 	}
 
 	#[pallet::event]
-	#[pallet::generate_deposit(pub(crate) fn deposit_event)]
+	#[pallet::generate_deposit(pub fn deposit_event)]
 	pub enum Event<T: Config> {
 		/// CurrencySet
 		/// [who, currency]
-		CurrencySet(T::AccountId, AssetId),
+		CurrencySet {
+			account_id: T::AccountId,
+			asset_id: AssetIdOf<T>,
+		},
 
 		/// New accepted currency added
-		/// [who, currency]
-		CurrencyAdded(T::AccountId, AssetId),
+		/// [currency]
+		CurrencyAdded { asset_id: AssetIdOf<T> },
 
 		/// Accepted currency removed
-		/// [who, currency]
-		CurrencyRemoved(T::AccountId, AssetId),
+		/// [currency]
+		CurrencyRemoved { asset_id: AssetIdOf<T> },
 
-		/// Member added
-		/// [who]
-		MemberAdded(T::AccountId),
+		/// Transaction fee paid in non-native currency
+		/// [Account, Currency, Native fee amount, Non-native fee amount, Destination account]
+		FeeWithdrawn {
+			account_id: T::AccountId,
+			asset_id: AssetIdOf<T>,
+			native_fee_amount: BalanceOf<T>,
+			non_native_fee_amount: BalanceOf<T>,
+			destination_account_id: T::AccountId,
+		},
 
-		/// Member removed
-		/// [who]
-		MemberRemoved(T::AccountId),
+		/// Signed-branch dispatch permit fee payer
+		FeeSponsored { from: H160, fee_payer: T::AccountId },
+
+		/// The EVM call dispatched by a permit did not succeed; the permit nonce is spent either way.
+		EvmPermitCallFailed {
+			from: H160,
+			to: H160,
+			nonce: U256,
+			reason: ExitReason,
+			output: BoundedVec<u8, ConstU32<MAX_EVM_CALL_OUTPUT_LEN>>,
+		},
 	}
 
 	#[pallet::error]
@@ -129,20 +204,11 @@ pub mod pallet {
 		/// Account balance should be non-zero.
 		ZeroBalance,
 
-		/// Account is not allowed to add or remove accepted currency.
-		NotAllowed,
-
 		/// Currency is already in the list of accepted currencies.
 		AlreadyAccepted,
 
 		/// It is not allowed to add Core Asset as accepted currency. Core asset is accepted by design.
 		CoreAssetNotAllowed,
-
-		/// Account is already member of authorities.
-		AlreadyMember,
-
-		/// Account is not a member of authorities.
-		NotAMember,
 
 		/// Fallback price cannot be zero.
 		ZeroPrice,
@@ -152,95 +218,89 @@ pub mod pallet {
 
 		/// Math overflow
 		Overflow,
+
+		/// It is not allowed to change payment currency of an EVM account.
+		EvmAccountNotAllowed,
+
+		/// EVM permit expired.
+		EvmPermitExpired,
+
+		/// EVM permit is invalid.
+		EvmPermitInvalid,
+
+		/// EVM permit call failed.
+		EvmPermitCallExecutionError,
+
+		/// EVM permit call failed.
+		EvmPermitRunnerError,
+
+		/// EVM permit must not affect account nonce.
+		EvmPermitNonceInvariantViolated,
 	}
 
 	/// Account currency map
 	#[pallet::storage]
 	#[pallet::getter(fn get_currency)]
-	pub type AccountCurrencyMap<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, AssetId, OptionQuery>;
+	pub type AccountCurrencyMap<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, AssetIdOf<T>, OptionQuery>;
 
-	/// Curated list of currencies which fees can be paid with
+	/// Curated list of currencies which fees can be paid mapped to corresponding fallback price
 	#[pallet::storage]
 	#[pallet::getter(fn currencies)]
-	pub type AcceptedCurrencies<T: Config> = StorageMap<_, Twox64Concat, AssetId, Price, OptionQuery>;
+	pub type AcceptedCurrencies<T: Config> = StorageMap<_, Twox64Concat, AssetIdOf<T>, Price, OptionQuery>;
+
+	/// Asset prices from the spot price provider or the fallback price if the price is not available. Updated at the beginning of every block.
+	#[pallet::storage]
+	#[pallet::getter(fn currency_price)]
+	pub type AcceptedCurrencyPrice<T: Config> = StorageMap<_, Twox64Concat, AssetIdOf<T>, Price, OptionQuery>;
 
 	#[pallet::storage]
-	#[pallet::getter(fn authorities)]
-	pub type Authorities<T: Config> = StorageValue<_, Vec<T::AccountId>, ValueQuery>;
-
-	/// Account to use when pool does not exist.
-	#[pallet::storage]
-	#[pallet::getter(fn fallback_account)]
-	pub type FallbackAccount<T: Config> = StorageValue<_, T::AccountId, ValueQuery>;
+	#[pallet::getter(fn tx_fee_currency_override)]
+	pub type TransactionCurrencyOverride<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, AssetIdOf<T>, OptionQuery>;
 
 	#[pallet::genesis_config]
+	#[derive(frame_support::DefaultNoBound)]
 	pub struct GenesisConfig<T: Config> {
-		pub currencies: Vec<(AssetId, Price)>,
-		pub authorities: Vec<T::AccountId>,
-		pub fallback_account: T::AccountId,
-	}
-
-	#[cfg(feature = "std")]
-	impl<T: Config> Default for GenesisConfig<T> {
-		fn default() -> Self {
-			GenesisConfig {
-				authorities: vec![],
-				currencies: vec![],
-				fallback_account: Default::default(),
-			}
-		}
+		pub currencies: Vec<(AssetIdOf<T>, Price)>,
+		pub account_currencies: Vec<(T::AccountId, AssetIdOf<T>)>,
 	}
 
 	#[pallet::genesis_build]
-	impl<T: Config> GenesisBuild<T> for GenesisConfig<T> {
+	impl<T: Config> BuildGenesisConfig for GenesisConfig<T> {
 		fn build(&self) {
-			if self.fallback_account == Default::default() {
-				panic!("Fallback account is not set");
-			}
-
-			FallbackAccount::<T>::put(self.fallback_account.clone());
-
-			Authorities::<T>::put(self.authorities.clone());
-
 			for (asset, price) in &self.currencies {
 				AcceptedCurrencies::<T>::insert(asset, price);
+			}
+
+			for (account, asset) in &self.account_currencies {
+				<AccountCurrencyMap<T>>::insert(account, asset);
 			}
 		}
 	}
 	#[pallet::call]
-	impl<T: Config> Pallet<T> {
+	impl<T: Config> Pallet<T>
+	where
+		BalanceOf<T>: FixedPointOperand,
+	{
 		/// Set selected currency for given account.
 		///
 		/// This allows to set a currency for an account in which all transaction fees will be paid.
 		/// Account balance cannot be zero.
 		///
-		/// Chosen currency must be in the list of accepted currencies.
+		/// In case of sufficient asset, the chosen currency must be in the list of accepted currencies
+		/// In case of insufficient asset, the chosen currency must have a XYK pool with DOT
 		///
 		/// When currency is set, fixed fee is withdrawn from the account to pay for the currency change
 		///
+		/// EVM accounts are now allowed to change thier payment currency.
+		///
 		/// Emits `CurrencySet` event when successful.
-		#[pallet::weight((<T as Config>::WeightInfo::set_currency(), DispatchClass::Normal, Pays::No))]
-		#[transactional]
-		pub fn set_currency(origin: OriginFor<T>, currency: AssetId) -> DispatchResultWithPostInfo {
+		#[pallet::call_index(0)]
+		#[pallet::weight(<T as Config>::WeightInfo::set_currency())]
+		pub fn set_currency(origin: OriginFor<T>, currency: AssetIdOf<T>) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 
-			if currency == CORE_ASSET_ID || AcceptedCurrencies::<T>::contains_key(&currency) {
-				if T::MultiCurrency::free_balance(currency, &who) == Balance::zero() {
-					return Err(Error::<T>::ZeroBalance.into());
-				}
-
-				<AccountCurrencyMap<T>>::insert(who.clone(), currency);
-
-				if T::WithdrawFeeForSetCurrency::get() == Pays::Yes {
-					Self::withdraw_set_fee(&who, currency)?;
-				}
-
-				Self::deposit_event(Event::CurrencySet(who, currency));
-
-				return Ok(().into());
-			}
-
-			Err(Error::<T>::UnsupportedCurrency.into())
+			Self::do_set_currency(&who, currency)
 		}
 
 		/// Add a currency to the list of accepted currencies.
@@ -250,23 +310,21 @@ pub mod pallet {
 		/// Currency must not be already accepted. Core asset id cannot be explicitly added.
 		///
 		/// Emits `CurrencyAdded` event when successful.
-		#[pallet::weight((<T as Config>::WeightInfo::add_currency(), DispatchClass::Normal, Pays::No))]
-		pub fn add_currency(origin: OriginFor<T>, currency: AssetId, price: Price) -> DispatchResultWithPostInfo {
-			let who = ensure_signed(origin)?;
+		#[pallet::call_index(1)]
+		#[pallet::weight(<T as Config>::WeightInfo::add_currency())]
+		pub fn add_currency(origin: OriginFor<T>, currency: AssetIdOf<T>, price: Price) -> DispatchResult {
+			T::AcceptedCurrencyOrigin::ensure_origin(origin)?;
 
-			ensure!(currency != CORE_ASSET_ID, Error::<T>::CoreAssetNotAllowed);
+			ensure!(currency != T::NativeAssetId::get(), Error::<T>::CoreAssetNotAllowed);
 
-			// Only selected accounts can perform this action
-			ensure!(Self::authorities().contains(&who), Error::<T>::NotAllowed);
-
-			AcceptedCurrencies::<T>::try_mutate_exists(currency, |maybe_price| -> DispatchResultWithPostInfo {
+			AcceptedCurrencies::<T>::try_mutate_exists(currency, |maybe_price| -> DispatchResult {
 				if maybe_price.is_some() {
 					return Err(Error::<T>::AlreadyAccepted.into());
 				}
 
 				*maybe_price = Some(price);
-				Self::deposit_event(Event::CurrencyAdded(who, currency));
-				Ok(().into())
+				Self::deposit_event(Event::CurrencyAdded { asset_id: currency });
+				Ok(())
 			})
 		}
 
@@ -276,238 +334,666 @@ pub mod pallet {
 		/// Core asset cannot be removed.
 		///
 		/// Emits `CurrencyRemoved` when successful.
-		#[pallet::weight((<T as Config>::WeightInfo::remove_currency(), DispatchClass::Normal, Pays::No))]
-		pub fn remove_currency(origin: OriginFor<T>, currency: AssetId) -> DispatchResultWithPostInfo {
-			let who = ensure_signed(origin)?;
+		#[pallet::call_index(2)]
+		#[pallet::weight(<T as Config>::WeightInfo::remove_currency())]
+		pub fn remove_currency(origin: OriginFor<T>, currency: AssetIdOf<T>) -> DispatchResult {
+			T::AcceptedCurrencyOrigin::ensure_origin(origin)?;
 
-			ensure!(currency != CORE_ASSET_ID, Error::<T>::CoreAssetNotAllowed);
+			ensure!(currency != T::NativeAssetId::get(), Error::<T>::CoreAssetNotAllowed);
 
-			// Only selected accounts can perform this action
-			ensure!(Self::authorities().contains(&who), Error::<T>::NotAllowed);
-
-			AcceptedCurrencies::<T>::try_mutate(currency, |x| -> DispatchResultWithPostInfo {
+			AcceptedCurrencies::<T>::try_mutate(currency, |x| -> DispatchResult {
 				if x.is_none() {
 					return Err(Error::<T>::UnsupportedCurrency.into());
 				}
 
 				*x = None;
 
-				Self::deposit_event(Event::CurrencyRemoved(who, currency));
+				Self::deposit_event(Event::CurrencyRemoved { asset_id: currency });
 
-				Ok(().into())
+				Ok(())
 			})
 		}
 
-		/// Add an account as member to list of authorities who can manage list of accepted currencies
+		/// Reset currency of the specified account to HDX.
+		/// If the account is EVM account, the payment currency is reset to WETH.
+		/// Only selected members can perform this action.
 		///
-		/// Members can be add or removed a currency from a list of accepted currencies.
-		///
-		/// Only root can be perform this action.
-		///
-		/// Emits `MemberAdded` when successful.
-		#[pallet::weight((<T as Config>::WeightInfo::add_member(), DispatchClass::Normal, Pays::No))]
-		pub fn add_member(origin: OriginFor<T>, member: T::AccountId) -> DispatchResultWithPostInfo {
-			ensure_root(origin)?;
+		/// Emits `CurrencySet` when successful.
+		#[pallet::call_index(3)]
+		#[pallet::weight(<T as Config>::WeightInfo::reset_payment_currency())]
+		pub fn reset_payment_currency(origin: OriginFor<T>, account_id: T::AccountId) -> DispatchResult {
+			T::AcceptedCurrencyOrigin::ensure_origin(origin)?;
 
-			ensure!(!Self::authorities().contains(&member), Error::<T>::AlreadyMember);
+			let currency = if T::InspectEvmAccounts::is_evm_account(account_id.clone()) {
+				let currency = T::EvmAssetId::get();
+				AccountCurrencyMap::<T>::insert(account_id.clone(), currency);
+				currency
+			} else {
+				AccountCurrencyMap::<T>::remove(account_id.clone());
+				T::NativeAssetId::get()
+			};
 
-			Self::add_new_member(&member);
+			Self::deposit_event(Event::CurrencySet {
+				account_id,
+				asset_id: currency,
+			});
 
-			Self::deposit_event(Event::MemberAdded(member));
-
-			Ok(().into())
+			Ok(())
 		}
 
-		/// Rmove account from list of authorities who can manage list of accepted currencies
+		/// Dispatch a pre-signed EVM permit.
 		///
-		/// Only root can be perform this action.
+		/// Unsigned: the EVM account `from` pays for the dispatch via
+		/// `withdraw_fee` in its chosen currency.
 		///
-		/// Emits `MemberRemoved` when successful.
-		#[pallet::weight((<T as Config>::WeightInfo::remove_member(), DispatchClass::Normal, Pays::No))]
-		pub fn remove_member(origin: OriginFor<T>, member: T::AccountId) -> DispatchResultWithPostInfo {
-			ensure_root(origin)?;
-
-			ensure!(Self::authorities().contains(&member), Error::<T>::NotAMember);
-
-			Authorities::<T>::mutate(|x| x.retain(|val| *val != member));
-
-			Self::deposit_event(Event::MemberRemoved(member));
-
-			Ok(().into())
+		/// Signed: the signer (paymaster) pays both the Substrate extrinsic
+		/// fee and the EVM-side gas; `permit.from` is touched only by the
+		/// inner call's effects. Root is rejected.
+		#[pallet::call_index(4)]
+		#[pallet::weight(
+			<T as Config>::EvmPermit::dispatch_weight(*gas_limit)
+		)]
+		pub fn dispatch_permit(
+			origin: OriginFor<T>,
+			from: H160,
+			to: H160,
+			value: U256,
+			data: Vec<u8>,
+			gas_limit: u64,
+			deadline: U256,
+			v: u8,
+			r: H256,
+			s: H256,
+		) -> DispatchResultWithPostInfo {
+			if let Ok(signer) = ensure_signed(origin.clone()) {
+				Self::do_dispatch_permit_signed(signer, from, to, value, data, gas_limit, deadline, v, r, s)
+			} else {
+				ensure_none(origin)?;
+				Self::do_dispatch_permit_unsigned(from, to, value, data, gas_limit, deadline, v, r, s)
+			}
 		}
 	}
-}
 
-impl<T: Config> Pallet<T> {
-	fn account_currency(who: &T::AccountId) -> AssetId {
-		Pallet::<T>::get_currency(who).unwrap_or(CORE_ASSET_ID)
-	}
+	impl<T: Config> Pallet<T>
+	where
+		BalanceOf<T>: FixedPointOperand,
+	{
+		pub(crate) fn do_dispatch_permit_unsigned(
+			from: H160,
+			to: H160,
+			value: U256,
+			data: Vec<u8>,
+			gas_limit: u64,
+			deadline: U256,
+			v: u8,
+			r: H256,
+			s: H256,
+		) -> DispatchResultWithPostInfo {
+			if T::EvmPermit::validate_permit(from, to, data.clone(), value, gas_limit, deadline, v, r, s).is_err() {
+				T::EvmPermit::on_dispatch_permit_error();
+				return Ok(PostDispatchInfo::default());
+			};
 
-	/// Execute a trade to buy HDX and sell selected currency.
-	pub fn swap_currency(who: &T::AccountId, fee: Balance) -> DispatchResult {
-		// Let's determine currency in which user would like to pay the fee
-		let fee_currency = match Pallet::<T>::get_currency(who) {
-			Some(c) => c,
-			_ => CORE_ASSET_ID,
-		};
+			let (gas_price, _) = T::EvmPermit::gas_price();
+			let account_id = T::InspectEvmAccounts::account_id(from);
 
-		// If not native currency, let's buy CORE asset first and then pay with that.
-		if fee_currency != CORE_ASSET_ID {
-			T::AMMPool::buy(
-				who,
-				AssetPair {
-					asset_out: CORE_ASSET_ID,
-					asset_in: fee_currency,
-				},
-				fee,
-				2u128 * fee,
-				false,
-			)?;
+			let currency = Pallet::<T>::permit_fee_currency(&account_id, &data);
+
+			TransactionCurrencyOverride::<T>::insert(account_id.clone(), currency);
+
+			let result = T::EvmPermit::dispatch_permit(from, to, data, value, gas_limit, gas_price, None, None, vec![])
+				.unwrap_or_else(|e| {
+					// RunnerError = account wasn't charged, so the dispatch can't have produced anything.
+					if !Self::evm_call_was_executed(&e.error) {
+						T::EvmPermit::on_dispatch_permit_error();
+					}
+					e.post_info
+				});
+
+			TransactionCurrencyOverride::<T>::remove(account_id.clone());
+
+			Ok(result)
 		}
 
-		Ok(())
-	}
+		pub(crate) fn do_dispatch_permit_signed(
+			signer: T::AccountId,
+			from: H160,
+			to: H160,
+			value: U256,
+			data: Vec<u8>,
+			gas_limit: u64,
+			deadline: U256,
+			v: u8,
+			r: H256,
+			s: H256,
+		) -> DispatchResultWithPostInfo {
+			let previous_fee_payer = T::EvmFeePayer::set_fee_payer(signer.clone());
 
-	pub fn add_new_member(who: &T::AccountId) {
-		Authorities::<T>::mutate(|x| x.push(who.clone()));
-	}
+			if let Err(e) = T::EvmPermit::validate_permit(from, to, data.clone(), value, gas_limit, deadline, v, r, s) {
+				Self::restore_fee_payer(previous_fee_payer);
+				return Err(e.into());
+			}
 
-	pub fn withdraw_set_fee(who: &T::AccountId, currency: AssetId) -> DispatchResult {
-		let base_fee = Self::weight_to_fee(T::BlockWeights::get().get(DispatchClass::Normal).base_extrinsic);
-		let adjusted_weight_fee = Self::weight_to_fee(T::WeightInfo::set_currency());
-		let fee = base_fee.saturating_add(adjusted_weight_fee);
+			let (gas_price, _) = T::EvmPermit::gas_price();
+			let result = T::EvmPermit::dispatch_permit(from, to, data, value, gas_limit, gas_price, None, None, vec![]);
 
-		Self::swap_currency(who, fee)?;
-		T::MultiCurrency::withdraw(currency, who, fee)?;
+			// Restore AFTER the dispatch so the runner's post-execution refund
+			// (`correct_and_deposit_fee`) also routes to the paymaster.
+			Self::restore_fee_payer(previous_fee_payer);
 
-		Ok(())
-	}
-
-	fn weight_to_fee(weight: Weight) -> Balance {
-		// cap the weight to the maximum defined in runtime, otherwise it will be the
-		// `Bounded` maximum of its data type, which is not desired.
-		let capped_weight: Weight = weight.min(T::BlockWeights::get().max_block);
-		<T as Config>::WeightToFee::calc(&capped_weight)
-	}
-}
-
-use crate::traits::PaymentSwapResult;
-use frame_support::dispatch::DispatchError;
-use traits::CurrencySwap;
-
-impl<T: Config> CurrencySwap<<T as frame_system::Config>::AccountId, Balance> for Pallet<T> {
-	fn swap(who: &T::AccountId, fee: u128) -> Result<PaymentSwapResult, DispatchError> {
-		match Self::account_currency(who) {
-			CORE_ASSET_ID => Ok(PaymentSwapResult::Native),
-			currency => {
-				if T::AMMPool::exists(AssetPair {
-					asset_in: currency,
-					asset_out: CORE_ASSET_ID,
-				}) {
-					Self::swap_currency(who, fee)?;
-					Ok(PaymentSwapResult::Swapped)
-				} else {
-					// If pool does not exists, let's use the currency fixed price
-
-					let price = Self::currencies(currency).ok_or(Error::<T>::FallbackPriceNotFound)?;
-
-					let amount = price.checked_mul_int(fee).ok_or(Error::<T>::Overflow)?;
-
-					T::MultiCurrency::transfer(currency, who, &Self::fallback_account(), amount)?;
-
-					Ok(PaymentSwapResult::Transferred)
+			match result {
+				Ok(post) => {
+					Self::deposit_event(Event::<T>::FeeSponsored {
+						from,
+						fee_payer: signer,
+					});
+					// Forward actual weight/`Pays::No`: charge gas used, not `gas_limit`.
+					Ok(post)
 				}
+				// RunnerError: nothing charged. Keep Err (`Pays::Yes`) so the paymaster
+				// still pays the extrinsic fee — the per-attempt cost that replaces the
+				// unsigned-path autopause. Never call `on_dispatch_permit_error()` here.
+				Err(e) if !Self::evm_call_was_executed(&e.error) => Err(e.error.into()),
+				// Revert already consumed the nonce and charged gas; commit it like the
+				// unsigned path. Returning Err would roll the nonce back → replayable.
+				Err(e) => Ok(e.post_info),
+			}
+		}
+
+		fn evm_call_was_executed(error: &DispatchError) -> bool {
+			*error == Error::<T>::EvmPermitCallExecutionError.into()
+				|| *error == Error::<T>::EvmPermitNonceInvariantViolated.into()
+		}
+
+		fn restore_fee_payer(previous: Option<T::AccountId>) {
+			match previous {
+				Some(prev) => {
+					let _ = T::EvmFeePayer::set_fee_payer(prev);
+				}
+				None => {
+					let _ = T::EvmFeePayer::clear_fee_payer();
+				}
+			}
+		}
+	}
+
+	#[pallet::validate_unsigned]
+	impl<T: Config> ValidateUnsigned for Pallet<T>
+	where
+		AssetIdOf<T>: Into<u32>,
+	{
+		type Call = Call<T>;
+
+		fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
+			match call {
+				Call::dispatch_permit {
+					from,
+					to,
+					value,
+					data,
+					gas_limit,
+					deadline,
+					v,
+					r,
+					s,
+				} => {
+					// We need to wrap this as separate tx, and since we also "dry-run" the dispatch,
+					// we need to rollback the changes if any
+					let result = with_transaction::<(), DispatchError, _>(|| {
+						// First verify signature
+						let result = T::EvmPermit::validate_permit(
+							*from,
+							*to,
+							data.clone(),
+							*value,
+							*gas_limit,
+							*deadline,
+							*v,
+							*r,
+							*s,
+						);
+						if let Some(error_res) = result.err() {
+							return TransactionOutcome::Rollback(Err(error_res));
+						}
+
+						// Set fee currency for the evm dispatch
+						let account_id = T::InspectEvmAccounts::account_id(*from);
+
+						let currency = Pallet::<T>::permit_fee_currency(&account_id, data);
+
+						TransactionCurrencyOverride::<T>::insert(account_id.clone(), currency);
+
+						let (gas_price, _) = T::EvmPermit::gas_price();
+
+						let result = T::EvmPermit::dispatch_permit(
+							*from,
+							*to,
+							data.clone(),
+							*value,
+							*gas_limit,
+							gas_price,
+							None,
+							None,
+							vec![],
+						);
+						TransactionCurrencyOverride::<T>::remove(&account_id);
+						match result {
+							Ok(_post_info) => TransactionOutcome::Rollback(Ok(())),
+							Err(e) => TransactionOutcome::Rollback(Err(e.error)),
+						}
+					});
+					let nonce = T::EvmPermit::permit_nonce(*from);
+					match result {
+						Ok(()) => ValidTransaction::with_tag_prefix("EVMPermit")
+							.and_provides((nonce, from))
+							.priority(0)
+							.longevity(64)
+							.propagate(true)
+							.build(),
+						Err(e) => {
+							let error_number = match e {
+								DispatchError::Module(ModuleError { error, .. }) => error[0],
+								_ => 0, // this case should never happen because an Error is always converted to DispatchError::Module(ModuleError)
+							};
+							InvalidTransaction::Custom(error_number).into()
+						}
+					}
+				}
+				_ => InvalidTransaction::Call.into(),
 			}
 		}
 	}
 }
 
-/// Implements the transaction payment for native as well as non-native currencies
-pub struct MultiCurrencyAdapter<C, OU, SW>(PhantomData<(C, OU, SW)>);
+impl<T: Config> Pallet<T> {
+	/// Returns the effective fee currency for `who`.
+	///
+	/// Behavior:
+	/// - If `get_currency(who)` is set and still accepted, return that per-account currency.
+	/// - Otherwise, default by account type:
+	///     * EVM account     → `T::EvmAssetId::get()`
+	///     * non-EVM account → `T::NativeAssetId::get()`
+	///
+	/// A stored currency that has since been de-listed falls back to the default rather than
+	/// stranding the account, so every fee path agrees on what is payable without depending on
+	/// storage cleanup having run.
+	pub fn account_currency(who: &T::AccountId) -> AssetIdOf<T>
+	where
+		BalanceOf<T>: FixedPointOperand,
+	{
+		Pallet::<T>::get_currency(who)
+			.filter(|currency| *currency == T::NativeAssetId::get() || AcceptedCurrencies::<T>::contains_key(currency))
+			.unwrap_or_else(|| {
+				if T::InspectEvmAccounts::is_evm_account(who.clone()) {
+					T::EvmAssetId::get()
+				} else {
+					T::NativeAssetId::get()
+				}
+			})
+	}
 
-impl<T, C, OU, SW> OnChargeTransaction<T> for MultiCurrencyAdapter<C, OU, SW>
+	/// Fee currency for an EVM permit dispatch.
+	///
+	/// A permit whose payload is a `set_currency` may pay its own gas in the currency it is about
+	/// to switch to, so that an account can move off a currency it can no longer afford. That is
+	/// only sound while the named currency is itself payable — otherwise the permit would charge
+	/// gas in an asset `set_currency` is going to reject.
+	fn permit_fee_currency(account_id: &T::AccountId, data: &[u8]) -> AssetIdOf<T>
+	where
+		BalanceOf<T>: FixedPointOperand,
+	{
+		let mut encoded_extrinsic = data;
+		let maybe_call: Result<T::RuntimeCall, _> =
+			DecodeLimit::decode_all_with_depth_limit(32, &mut encoded_extrinsic);
+
+		maybe_call
+			.ok()
+			.and_then(|call| T::TryCallCurrency::try_convert(&call).ok())
+			.filter(|currency| *currency == T::NativeAssetId::get() || AcceptedCurrencies::<T>::contains_key(currency))
+			.unwrap_or_else(|| Pallet::<T>::account_currency(account_id))
+	}
+
+	fn do_set_currency(who: &T::AccountId, currency: AssetIdOf<T>) -> DispatchResult {
+		ensure!(
+			currency == T::NativeAssetId::get() || AcceptedCurrencies::<T>::contains_key(currency),
+			Error::<T>::UnsupportedCurrency
+		);
+
+		<AccountCurrencyMap<T>>::insert(who.clone(), currency);
+
+		Self::deposit_event(Event::CurrencySet {
+			account_id: who.clone(),
+			asset_id: currency,
+		});
+
+		Ok(())
+	}
+
+	fn get_currency_price(currency: AssetIdOf<T>) -> Option<Price>
+	where
+		BalanceOf<T>: FixedPointOperand,
+	{
+		// A live oracle route is not enough to make an asset payable: the currency must be
+		// whitelisted. `resolve_currency_from_call` can hand us any asset (a batched
+		// `set_currency` names its own target), so the gate belongs here rather than at the caller.
+		if currency != T::NativeAssetId::get() && !AcceptedCurrencies::<T>::contains_key(currency) {
+			return None;
+		}
+
+		if let Some(price) = <Pallet<T> as NativePriceOracle<AssetIdOf<T>, Price>>::price(currency) {
+			Some(price)
+		} else {
+			// If not loaded in on_init, let's try first the spot price provider again
+			// This is unlikely scenario as the price would be retrieved in on_init for each block
+			let maybe_price = Self::get_oracle_price(currency, T::NativeAssetId::get());
+
+			if let Some(price) = maybe_price {
+				Some(price)
+			} else {
+				Self::currencies(currency)
+			}
+		}
+	}
+
+	fn get_oracle_price(
+		asset_id: <T::Currencies as MultiCurrency<T::AccountId>>::CurrencyId,
+		native_asset: <T::Currencies as MultiCurrency<T::AccountId>>::CurrencyId,
+	) -> Option<FixedU128> {
+		let on_chain_route = T::RouteProvider::get_route(AssetPair::new(asset_id, native_asset));
+
+		T::OraclePriceProvider::price(&on_chain_route, OraclePeriod::TenMinutes)
+			.map(|ratio| FixedU128::from_rational(ratio.n, ratio.d))
+	}
+}
+
+fn convert_fee_with_price<B>(fee: B, price: FixedU128) -> Option<B>
+where
+	B: FixedPointOperand + Ord + One,
+{
+	// Make sure that the fee is never less than 1
+	price.checked_mul_int(fee).map(|f| f.max(One::one()))
+}
+
+/// Deposits all fees to some account
+pub struct DepositAll<T>(PhantomData<T>);
+
+impl<T: Config> DepositFee<T::AccountId, AssetIdOf<T>, BalanceOf<T>> for DepositAll<T> {
+	fn deposit_fee(who: &T::AccountId, currency: AssetIdOf<T>, amount: BalanceOf<T>) -> DispatchResult {
+		<T as Config>::Currencies::deposit(currency, who, amount)?;
+		Ok(())
+	}
+}
+
+/// Implements the transaction payment for native as well as non-native currencies
+pub struct TransferFees<T, MC, DF, FR, WF>(PhantomData<(T, MC, DF, FR, WF)>);
+
+impl<T, MC, DF, FR, WF> OnChargeTransaction<T> for TransferFees<T, MC, DF, FR, WF>
 where
 	T: Config,
-	T::TransactionByteFee: Get<<C as Currency<<T as frame_system::Config>::AccountId>>::Balance>,
-	C: Currency<<T as frame_system::Config>::AccountId>,
-	C::PositiveImbalance:
-		Imbalance<<C as Currency<<T as frame_system::Config>::AccountId>>::Balance, Opposite = C::NegativeImbalance>,
-	C::NegativeImbalance:
-		Imbalance<<C as Currency<<T as frame_system::Config>::AccountId>>::Balance, Opposite = C::PositiveImbalance>,
-	OU: OnUnbalanced<NegativeImbalanceOf<C, T>>,
-	C::Balance: Into<Balance>,
-	SW: CurrencySwap<T::AccountId, Balance>,
+	MC: MultiCurrency<<T as frame_system::Config>::AccountId>,
+	AssetIdOf<T>: Into<MC::CurrencyId>,
+	MC::Balance: FixedPointOperand,
+	FR: Get<T::AccountId>,
+	DF: DepositFee<T::AccountId, MC::CurrencyId, MC::Balance>,
+	BalanceOf<T>: FixedPointOperand,
+	BalanceOf<T>: From<MC::Balance>,
+	WF: WithdrawFuseControl,
 {
-	type LiquidityInfo = Option<NegativeImbalanceOf<C, T>>;
-	type Balance = <C as Currency<<T as frame_system::Config>::AccountId>>::Balance;
+	type LiquidityInfo = Option<PaymentInfo<Self::Balance, AssetIdOf<T>, Price>>;
+	type Balance = <MC as MultiCurrency<<T as frame_system::Config>::AccountId>>::Balance;
 
 	/// Withdraw the predicted fee from the transaction origin.
 	///
 	/// Note: The `fee` already includes the `tip`.
 	fn withdraw_fee(
 		who: &T::AccountId,
-		_call: &T::Call,
-		_info: &DispatchInfoOf<T::Call>,
+		call: &T::RuntimeCall,
+		_info: &DispatchInfoOf<T::RuntimeCall>,
 		fee: Self::Balance,
-		tip: Self::Balance,
+		_tip: Self::Balance,
 	) -> Result<Self::LiquidityInfo, TransactionValidityError> {
 		if fee.is_zero() {
 			return Ok(None);
 		}
 
-		let withdraw_reason = if tip.is_zero() {
-			WithdrawReasons::TRANSACTION_PAYMENT
-		} else {
-			WithdrawReasons::TRANSACTION_PAYMENT | WithdrawReasons::TIP
-		};
+		let currency = Self::resolve_currency_from_call(who, call);
 
-		if let Ok(detail) = SW::swap(who, fee.into()) {
-			match detail {
-				PaymentSwapResult::Transferred => Ok(None),
-				PaymentSwapResult::Error => Err(InvalidTransaction::Payment.into()),
-				PaymentSwapResult::Native | PaymentSwapResult::Swapped => {
-					match C::withdraw(who, fee, withdraw_reason, ExistenceRequirement::KeepAlive) {
-						Ok(imbalance) => Ok(Some(imbalance)),
-						Err(_) => Err(InvalidTransaction::Payment.into()),
-					}
+		let price = Pallet::<T>::get_currency_price(currency)
+			.ok_or(TransactionValidityError::Invalid(InvalidTransaction::Payment))?;
+
+		let converted_fee =
+			convert_fee_with_price(fee, price).ok_or(TransactionValidityError::Invalid(InvalidTransaction::Payment))?;
+
+		WF::set_withdraw_fuse_active(false);
+		let res = match MC::withdraw(currency.into(), who, converted_fee, ExistenceRequirement::AllowDeath) {
+			Ok(()) => {
+				if currency == T::NativeAssetId::get() {
+					Ok(Some(PaymentInfo::Native(fee)))
+				} else {
+					Ok(Some(PaymentInfo::NonNative(converted_fee, currency, price)))
 				}
 			}
-		} else {
-			Err(InvalidTransaction::Payment.into())
-		}
+			Err(_) => Err(InvalidTransaction::Payment.into()),
+		};
+		WF::set_withdraw_fuse_active(true);
+
+		res
 	}
 
-	/// Hand the fee and the tip over to the `[OnUnbalanced]` implementation.
 	/// Since the predicted fee might have been too high, parts of the fee may
 	/// be refunded.
 	///
 	/// Note: The `fee` already includes the `tip`.
-	/// Note: This is the default implementation
 	fn correct_and_deposit_fee(
 		who: &T::AccountId,
-		_dispatch_info: &DispatchInfoOf<T::Call>,
-		_post_info: &PostDispatchInfoOf<T::Call>,
+		_dispatch_info: &DispatchInfoOf<T::RuntimeCall>,
+		_post_info: &PostDispatchInfoOf<T::RuntimeCall>,
 		corrected_fee: Self::Balance,
 		tip: Self::Balance,
 		already_withdrawn: Self::LiquidityInfo,
 	) -> Result<(), TransactionValidityError> {
+		let fee_receiver = FR::get();
+
 		if let Some(paid) = already_withdrawn {
 			// Calculate how much refund we should return
-			let refund_amount = paid.peek().saturating_sub(corrected_fee);
-			// refund to the the account that paid the fees. If this fails, the
-			// account might have dropped below the existential balance. In
-			// that case we don't refund anything.
-			let refund_imbalance =
-				C::deposit_into_existing(who, refund_amount).unwrap_or_else(|_| C::PositiveImbalance::zero());
-			// merge the imbalance caused by paying the fees and refunding parts of it again.
-			let adjusted_paid = paid
-				.offset(refund_imbalance)
-				.same()
+			let (currency, refund, fee, tip) = match paid {
+				PaymentInfo::Native(paid_fee) => (
+					T::NativeAssetId::get().into(),
+					paid_fee.saturating_sub(corrected_fee),
+					corrected_fee.saturating_sub(tip),
+					tip,
+				),
+				PaymentInfo::NonNative(paid_fee, currency, price) => {
+					// calculate corrected_fee in the non-native currency
+					let converted_corrected_fee = convert_fee_with_price(corrected_fee, price)
+						.ok_or(TransactionValidityError::Invalid(InvalidTransaction::Payment))?;
+					let refund = paid_fee.saturating_sub(converted_corrected_fee);
+					let converted_tip = price
+						.checked_mul_int(tip)
+						.ok_or(TransactionValidityError::Invalid(InvalidTransaction::Payment))?;
+					(
+						currency.into(),
+						refund,
+						converted_corrected_fee.saturating_sub(converted_tip),
+						converted_tip,
+					)
+				}
+			};
+
+			WF::set_withdraw_fuse_active(false);
+
+			// refund to the account that paid the fees
+			MC::deposit(currency, who, refund)
 				.map_err(|_| TransactionValidityError::Invalid(InvalidTransaction::Payment))?;
-			// Call someone else to handle the imbalance (fee and tip separately)
-			let imbalances = adjusted_paid.split(tip);
-			OU::on_unbalanceds(Some(imbalances.0).into_iter().chain(Some(imbalances.1)));
+
+			// deposit the fee
+			DF::deposit_fee(&fee_receiver, currency, fee + tip)
+				.map_err(|_| TransactionValidityError::Invalid(InvalidTransaction::Payment))?;
+
+			WF::set_withdraw_fuse_active(true);
 		}
+
 		Ok(())
+	}
+
+	fn can_withdraw_fee(
+		who: &T::AccountId,
+		call: &T::RuntimeCall,
+		_info: &DispatchInfoOf<T::RuntimeCall>,
+		fee: Self::Balance,
+		_tip: Self::Balance,
+	) -> Result<(), TransactionValidityError> {
+		if fee.is_zero() {
+			return Ok(());
+		}
+
+		let currency = Self::resolve_currency_from_call(who, call);
+
+		// Convert fee from native currency to the target currency before checking
+		let price = Pallet::<T>::get_currency_price(currency)
+			.ok_or(TransactionValidityError::Invalid(InvalidTransaction::Payment))?;
+		let converted_fee =
+			convert_fee_with_price(fee, price).ok_or(TransactionValidityError::Invalid(InvalidTransaction::Payment))?;
+
+		MC::ensure_can_withdraw(currency.into(), who, converted_fee).map_err(|_| InvalidTransaction::Payment.into())
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn endow_account(who: &T::AccountId, amount: Self::Balance) {
+		let currency = Pallet::<T>::account_currency(who);
+		let _ = MC::deposit(currency.into(), who, amount);
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn minimum_balance() -> Self::Balance {
+		// Without any context, return native asset's minimum balance
+		MC::minimum_balance(T::NativeAssetId::get().into())
+	}
+}
+
+impl<T: Config, MC, DF, FR, WF> TransferFees<T, MC, DF, FR, WF>
+where
+	MC: MultiCurrency<T::AccountId>,
+	AssetIdOf<T>: Into<MC::CurrencyId>,
+	WF: WithdrawFuseControl,
+{
+	fn resolve_currency_from_call(who: &T::AccountId, call: &T::RuntimeCall) -> AssetIdOf<T> {
+		T::TryCallCurrency::try_convert(call).unwrap_or_else(|_| Pallet::<T>::account_currency(who))
+	}
+}
+
+/// We provide an oracle for the price of all currencies accepted as fee payment.
+/// In the else statement, first we try to get the price from cache, otherwise we calculate it
+/// The price calculation based on onchain-route is mainly used by EVM dry run as in the dry run we dont have storage filled with prices, so calculation is needed
+impl<T: Config> NativePriceOracle<AssetIdOf<T>, Price> for Pallet<T> {
+	fn price(currency: AssetIdOf<T>) -> Option<Price> {
+		if currency == T::NativeAssetId::get() {
+			return Some(Price::one());
+		}
+
+		// Consumers of this oracle (XCM `Trader`, `XcmPaymentApi`) read a price as permission to
+		// charge in that asset, so the route-based fallback below must stay inside the whitelist.
+		if !AcceptedCurrencies::<T>::contains_key(currency) {
+			return None;
+		}
+
+		Pallet::<T>::currency_price(currency).or_else(|| Self::get_oracle_price(currency, T::NativeAssetId::get()))
+	}
+}
+
+/// Type to automatically add a fee currency for an account on account creation.
+pub struct AddTxAssetOnAccount<T>(PhantomData<T>);
+impl<T: Config> Happened<(T::AccountId, AssetIdOf<T>)> for AddTxAssetOnAccount<T> {
+	fn happened((who, currency): &(T::AccountId, AssetIdOf<T>)) {
+		if !AccountCurrencyMap::<T>::contains_key(who)
+			&& AcceptedCurrencies::<T>::contains_key(currency)
+			&& T::Currencies::total_balance(T::NativeAssetId::get(), who).is_zero()
+		{
+			AccountCurrencyMap::<T>::insert(who, currency);
+		}
+	}
+}
+
+/// Type to automatically remove the fee currency for an account on account deletion.
+///
+/// Note: The fee currency is only removed if the system account is gone or the account
+/// corresponding to the fee currency is empty.
+pub struct RemoveTxAssetOnKilled<T>(PhantomData<T>);
+impl<T: Config> Happened<(T::AccountId, AssetIdOf<T>)> for RemoveTxAssetOnKilled<T> {
+	fn happened((who, _currency): &(T::AccountId, AssetIdOf<T>)) {
+		if !frame_system::Pallet::<T>::account_exists(who) {
+			AccountCurrencyMap::<T>::remove(who);
+		} else if let Some(currency) = AccountCurrencyMap::<T>::get(who) {
+			if T::Currencies::total_balance(currency, who).is_zero() {
+				AccountCurrencyMap::<T>::remove(who);
+			}
+		}
+	}
+}
+
+impl<T: Config> Contains<AssetIdOf<T>> for Pallet<T> {
+	fn contains(currency: &AssetIdOf<T>) -> bool {
+		AcceptedCurrencies::<T>::contains_key(currency)
+	}
+}
+
+impl<T: Config> GetByKey<AssetIdOf<T>, Option<FixedU128>> for Pallet<T> {
+	fn get(k: &AssetIdOf<T>) -> Option<FixedU128> {
+		AcceptedCurrencyPrice::<T>::get(k)
+	}
+}
+
+/// Provides account's fee payment asset or default fee asset ( Native asset )
+impl<T: Config> AccountFeeCurrency<T::AccountId> for Pallet<T> {
+	type AssetId = AssetIdOf<T>;
+
+	fn get(who: &T::AccountId) -> Self::AssetId {
+		Pallet::<T>::account_currency(who)
+	}
+
+	fn set(who: &T::AccountId, asset_id: Self::AssetId) -> DispatchResult {
+		Self::do_set_currency(who, asset_id)
+	}
+	fn is_payment_currency(currency: Self::AssetId) -> DispatchResult {
+		ensure!(
+			currency == T::NativeAssetId::get() || AcceptedCurrencies::<T>::contains_key(currency),
+			Error::<T>::UnsupportedCurrency
+		);
+
+		Ok(())
+	}
+}
+
+/// Test-only implementation of `TryCallCurrency` for unit tests.
+/// Handles `set_currency` and batch patterns, but not `dispatch_with_extra_gas`
+/// (which requires `pallet_dispatcher` dependency).
+pub struct TestCallCurrency<T>(PhantomData<T>);
+impl<T: Config + pallet_utility::Config> TryConvert<&<T as frame_system::Config>::RuntimeCall, AssetIdOf<T>>
+	for TestCallCurrency<T>
+where
+	<T as frame_system::Config>::RuntimeCall: IsSubType<Call<T>> + IsSubType<pallet_utility::pallet::Call<T>>,
+	<T as pallet_utility::Config>::RuntimeCall: IsSubType<Call<T>>,
+{
+	fn try_convert(
+		call: &<T as frame_system::Config>::RuntimeCall,
+	) -> Result<AssetIdOf<T>, &<T as frame_system::Config>::RuntimeCall> {
+		// Handle direct set_currency calls
+		if let Some(Call::set_currency { currency }) = call.is_sub_type() {
+			return Ok(*currency);
+		}
+
+		// Handle batch/batch_all/force_batch with set_currency as first call
+		if let Some(pallet_utility::pallet::Call::batch { calls })
+		| Some(pallet_utility::pallet::Call::batch_all { calls })
+		| Some(pallet_utility::pallet::Call::force_batch { calls }) = call.is_sub_type()
+		{
+			if let Some(first_call) = calls.first() {
+				if let Some(Call::set_currency { currency }) = first_call.is_sub_type() {
+					return Ok(*currency);
+				}
+			}
+		}
+
+		Err(call)
 	}
 }

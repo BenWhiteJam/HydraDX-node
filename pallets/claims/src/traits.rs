@@ -17,29 +17,32 @@
 
 #![allow(clippy::redundant_slicing)]
 
-use codec::{Decode, Encode};
+use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 
 use sp_io::{crypto::secp256k1_ecdsa_recover, hashing::keccak_256};
 use sp_std::vec::Vec;
 
-#[cfg(feature = "std")]
+use scale_info::prelude::format;
+use scale_info::prelude::string::String;
+use scale_info::TypeInfo;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Clone, Copy, PartialEq, Eq, Encode, Decode, Default, Debug)]
+#[derive(
+	Clone, Copy, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, Default, Debug, TypeInfo, MaxEncodedLen,
+)]
 pub struct EthereumAddress(pub [u8; 20]);
 
-#[cfg(feature = "std")]
 impl Serialize for EthereumAddress {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: Serializer,
 	{
 		let hex: String = rustc_hex::ToHex::to_hex(&self.0[..]);
-		serializer.serialize_str(&format!("0x{}", hex))
+		serializer.serialize_str(&format!("0x{hex}"))
 	}
 }
 
-#[cfg(feature = "std")]
 impl<'de> Deserialize<'de> for EthereumAddress {
 	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
 	where
@@ -53,14 +56,14 @@ impl<'de> Deserialize<'de> for EthereumAddress {
 				"Bad length of Ethereum address (should be 42 including '0x')",
 			));
 		}
-		let raw: Vec<u8> = rustc_hex::FromHex::from_hex(s).map_err(|e| serde::de::Error::custom(format!("{:?}", e)))?;
+		let raw: Vec<u8> = rustc_hex::FromHex::from_hex(s).map_err(|e| serde::de::Error::custom(format!("{e:?}")))?;
 		let mut r = Self::default();
 		r.0.copy_from_slice(&raw);
 		Ok(r)
 	}
 }
 
-#[derive(Encode, Decode, Clone)]
+#[derive(Encode, Decode, DecodeWithMemTracking, Clone, TypeInfo)]
 pub struct EcdsaSignature(pub [u8; 65]);
 
 impl PartialEq for EcdsaSignature {

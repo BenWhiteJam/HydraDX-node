@@ -1,4 +1,4 @@
-// This file is part of HydraDX.
+// This file is part of HydraDX-node.
 
 // Copyright (C) 2020-2021  Intergalactic, Limited (GIB).
 // SPDX-License-Identifier: Apache-2.0
@@ -16,18 +16,25 @@
 // limitations under the License.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![allow(clippy::upper_case_acronyms)]
-
-use codec::{Decode, Encode};
-
-use primitive_types::U256;
-#[cfg(feature = "std")]
-use serde::{Deserialize, Serialize};
 
 use frame_support::sp_runtime::FixedU128;
 
-pub mod asset;
-pub mod traits;
+/// Opaque, encoded, unchecked extrinsic.
+pub use frame_support::sp_runtime::OpaqueExtrinsic as UncheckedExtrinsic;
+use frame_support::sp_runtime::{
+	generic,
+	traits::{BlakeTwo256, IdentifyAccount, Verify},
+	MultiSignature,
+};
+use sp_core::H160;
+
+pub mod constants;
+
+/// An index to a block.
+pub type BlockNumber = u32;
+
+/// Type used for expressing timestamp.
+pub type Moment = u64;
 
 /// Type for storing the id of an asset.
 pub type AssetId = u32;
@@ -41,106 +48,33 @@ pub type Amount = i128;
 /// Price
 pub type Price = FixedU128;
 
-/// Scaled Unsigned of Balance
-pub type HighPrecisionBalance = U256;
-pub type LowPrecisionBalance = u128;
+/// NFT Collection ID
+pub type CollectionId = u128;
 
-#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-#[derive(Debug, Encode, Decode, Clone, Copy, PartialEq, Eq)]
-pub enum IntentionType {
-	SELL,
-	BUY,
-}
+/// NFT Item ID
+pub type ItemId = u128;
 
-impl Default for IntentionType {
-	fn default() -> IntentionType {
-		IntentionType::SELL
-	}
-}
+/// Alias to 512-bit hash when used in the context of a transaction signature on the chain.
+pub type Signature = MultiSignature;
 
-#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-#[derive(Encode, Decode, Default, Clone, PartialEq)]
-pub struct ExchangeIntention<AccountId, Balance, IntentionID> {
-	pub who: AccountId,
-	pub assets: asset::AssetPair,
-	pub amount_in: Balance,
-	pub amount_out: Balance,
-	pub trade_limit: Balance,
-	pub discount: bool,
-	pub sell_or_buy: IntentionType,
-	pub intention_id: IntentionID,
-}
+/// Some way of identifying an account on the chain. We intentionally make it equivalent
+/// to the public key of our transaction signing scheme.
+pub type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::AccountId;
 
-pub mod fee {
-	use super::*;
+pub type EvmAddress = H160;
 
-	#[cfg_attr(feature = "std", derive(Serialize, Deserialize))]
-	#[derive(Debug, Encode, Decode, Copy, Clone, PartialEq, Eq)]
-	pub struct Fee {
-		pub numerator: u32,
-		pub denominator: u32,
-	}
+/// The type for looking up accounts. We don't expect more than 4 billion of them, but you
+/// never know...
+pub type AccountIndex = u32;
 
-	impl Default for Fee {
-		fn default() -> Self {
-			Fee {
-				numerator: 2,
-				denominator: 1000,
-			} // 0.2%
-		}
-	}
+/// Index of a transaction in the chain.
+pub type Index = u32;
 
-	pub trait WithFee
-	where
-		Self: Sized,
-	{
-		fn with_fee(&self, fee: Fee) -> Option<Self>;
-		fn without_fee(&self, fee: Fee) -> Option<Self>;
-		fn just_fee(&self, fee: Fee) -> Option<Self>;
-		fn discounted_fee(&self) -> Option<Self>;
-	}
+/// A hash of some data used by the chain.
+pub type Hash = sp_core::H256;
 
-	impl WithFee for Balance {
-		fn with_fee(&self, fee: Fee) -> Option<Self> {
-			self.checked_mul(fee.denominator as Self + fee.numerator as Self)?
-				.checked_div(fee.denominator as Self)
-		}
+/// Header type.
+pub type Header = generic::Header<BlockNumber, BlakeTwo256>;
 
-		fn without_fee(&self, fee: Fee) -> Option<Self> {
-			self.checked_mul(fee.denominator as Self)?
-				.checked_div(fee.denominator as Self + fee.numerator as Self)
-		}
-
-		fn just_fee(&self, fee: Fee) -> Option<Self> {
-			self.checked_mul(fee.numerator as Self)?
-				.checked_div(fee.denominator as Self)
-		}
-
-		fn discounted_fee(&self) -> Option<Self> {
-			let fee = Fee {
-				numerator: 7,
-				denominator: 10000,
-			};
-			self.just_fee(fee)
-		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::fee::*;
-
-	#[test]
-	// This function tests that fee calculations return correct amounts
-	fn fee_calculations_should_work() {
-		let fee = Fee{
-			numerator: 2,
-			denominator: 1_000,
-		};
-
-		assert_eq!(1_000.with_fee(fee), Some(1_002));
-		assert_eq!(1_002.without_fee(fee), Some(1_000));
-		assert_eq!(1_000.just_fee(fee), Some(2));
-		assert_eq!(1_000_000.discounted_fee(), Some(700));
-	}
-}
+/// Block type.
+pub type Block = generic::Block<Header, UncheckedExtrinsic>;

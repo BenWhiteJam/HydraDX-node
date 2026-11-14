@@ -1,0 +1,27 @@
+version: '3.3'
+services:
+  hydration:
+    image: galacticcouncil/fork:latest
+    environment:
+      - CHAIN_NAME: Hydration Fork
+      #- STATE_SOURCE: https://snapshots.play.hydration.cloud/state.json
+      #- STATE_RPC: wss://rpc.hydradx.cloud
+      #- STATE_BLOCK: 0x98923290c2d8f032d371dd65b239ebde6be2318c5d6ca1ed8de33fe966799933
+    volumes:
+      - data:/zombienet/hydration-node/launch-configs/fork/data
+    networks:
+      - gateway
+    logging:
+      driver: json-file
+    deploy:
+      labels:
+        traefik.http.routers.fork.rule: Host(`fork.lark.hydration.cloud`)
+        traefik.http.routers.fork.tls: 'true'
+        traefik.http.routers.fork.tls.certresolver: myresolver
+        traefik.http.services.fork.loadbalancer.server.port: '9988'
+networks:
+  gateway:
+    external: true
+volumes:
+  data:
+    driver: local

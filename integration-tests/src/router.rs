@@ -1,0 +1,5529 @@
+#![cfg(test)]
+#![allow(clippy::identity_op)]
+use super::assert_balance;
+use crate::polkadot_test_net::*;
+use hydradx_runtime::{
+	AssetRegistry, BlockNumber, Currencies, FeeProcessor, Omnipool, Router, RouterWeightInfo, Runtime, RuntimeOrigin,
+	Stableswap, LBP, XYK,
+};
+use sp_core::bounded_vec::BoundedVec;
+
+use pallet_broadcast::types::Destination;
+
+use hydradx_traits::router::AssetPair as Pair;
+use hydradx_traits::router::RouteSpotPriceProvider;
+use hydradx_traits::{
+	registry::Create,
+	router::{PoolType, Trade},
+	AssetKind, AMM,
+};
+use pallet_broadcast::types::Asset;
+use pallet_broadcast::types::ExecutionType;
+use pallet_broadcast::types::Fee;
+use pallet_lbp::weights::WeightInfo as LbpWeights;
+use pallet_lbp::WeightCurveType;
+use pallet_omnipool::traits::OmnipoolHooks;
+use pallet_omnipool::weights::WeightInfo as OmnipoolWeights;
+use pallet_route_executor::AmmTradeWeights;
+use primitives::AssetId;
+use sp_runtime::FixedPointNumber;
+use std::convert::Into;
+
+use frame_support::{assert_noop, assert_ok};
+use xcm_emulator::TestExt;
+
+use frame_support::storage::with_transaction;
+use hydradx_traits::stableswap::AssetAmount;
+use pallet_stableswap::MAX_ASSETS_IN_POOL;
+use sp_runtime::{traits::Zero, DispatchError, DispatchResult, FixedU128, Permill, TransactionOutcome};
+
+use orml_traits::MultiCurrency;
+pub const LBP_SALE_START: BlockNumber = 10;
+pub const LBP_SALE_END: BlockNumber = 40;
+
+#[test]
+fn router_weights_should_be_non_zero() {
+	assert!(!RouterWeightInfo::sell_and_calculate_sell_trade_amounts_overhead_weight(0, 1).is_zero());
+	assert!(!RouterWeightInfo::sell_and_calculate_sell_trade_amounts_overhead_weight(1, 1).is_zero());
+
+	assert!(!RouterWeightInfo::buy_and_calculate_buy_trade_amounts_overhead_weight(0, 1).is_zero());
+	assert!(!RouterWeightInfo::buy_and_calculate_buy_trade_amounts_overhead_weight(1, 0).is_zero());
+	assert!(!RouterWeightInfo::buy_and_calculate_buy_trade_amounts_overhead_weight(2, 1).is_zero());
+}
+
+mod router_different_pools_tests {
+	use super::*;
+	use crate::assert_reserved_balance;
+	use hydradx_traits::router::PoolType;
+	use pallet_broadcast::types::ExecutionType;
+
+	#[test]
+	fn route_should_fail_when_route_is_not_consistent() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+			create_xyk_pool_with_amounts(DAI, 1000000 * UNITS, DOT, 1000000 * UNITS);
+			create_xyk_pool_with_amounts(ETH, 1000000 * UNITS, DOT, 1000000 * UNITS);
+
+			assert_ok!(Currencies::update_balance(
+				hydradx_runtime::RuntimeOrigin::root(),
+				BOB.into(),
+				ETH,
+				300000000 * UNITS as i128,
+			));
+
+			let amount_to_sell = UNITS;
+			let limit = 0;
+			let trades = vec![
+				Trade {
+					pool: PoolType::Omnipool,
+					asset_in: HDX,
+					asset_out: DAI,
+				},
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: ETH,
+					asset_out: DOT,
+				},
+			];
+
+			//Act
+			assert_noop!(
+				Router::sell(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					DOT,
+					amount_to_sell,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_route_executor::Error::<Runtime>::InvalidRoute
+			);
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_route_contains_trades_with_different_pools() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+			create_lbp_pool(DAI, LRNA);
+			create_xyk_pool(HDX, DOT);
+
+			let amount_to_sell = UNITS / 100;
+			let limit = 0;
+			let trades = vec![
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: DAI,
+					asset_out: LRNA,
+				},
+				Trade {
+					pool: PoolType::Omnipool,
+					asset_in: LRNA,
+					asset_out: HDX,
+				},
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: HDX,
+					asset_out: DOT,
+				},
+			];
+
+			start_lbp_campaign();
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				DAI,
+				DOT,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 2230008413831;
+
+			assert_balance!(BOB.into(), DAI, 1_000_000_000 * UNITS - amount_to_sell);
+			assert_balance!(BOB.into(), LRNA, BOB_INITIAL_LRNA_BALANCE);
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+			assert_balance!(BOB.into(), DOT, amount_out);
+		});
+
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (stable_pool_id, stable_asset_1, stable_asset_2) = init_stableswap().unwrap();
+				create_lbp_pool(DAI, HDX);
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				create_xyk_pool(HDX, stable_asset_1);
+
+				let amount_to_sell = UNITS * 10;
+				let limit = 0;
+				let trades = vec![
+					Trade {
+						pool: PoolType::LBP,
+						asset_in: DAI,
+						asset_out: HDX,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: HDX,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::Stableswap(stable_pool_id),
+						asset_in: stable_asset_1,
+						asset_out: stable_asset_2,
+					},
+				];
+
+				start_lbp_campaign();
+
+				//Act
+				assert_ok!(Router::sell(
+					RuntimeOrigin::signed(BOB.into()),
+					DAI,
+					stable_asset_2,
+					amount_to_sell,
+					limit,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				let amount_out = 2486074848267;
+
+				assert_balance!(BOB.into(), DAI, 1_000_000_000 * UNITS - amount_to_sell);
+				assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+				assert_balance!(BOB.into(), stable_asset_1, 0);
+				assert_balance!(BOB.into(), stable_asset_2, amount_out);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn buy_should_work_when_route_contains_trades_with_different_pools() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+			create_lbp_pool(DAI, LRNA);
+			create_xyk_pool(HDX, DOT);
+
+			let amount_to_buy = UNITS;
+			let limit = 100 * UNITS;
+			let trades = vec![
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: DAI,
+					asset_out: LRNA,
+				},
+				Trade {
+					pool: PoolType::Omnipool,
+					asset_in: LRNA,
+					asset_out: HDX,
+				},
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: HDX,
+					asset_out: DOT,
+				},
+			];
+
+			start_lbp_campaign();
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				DAI,
+				DOT,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 4370898989;
+
+			assert_balance!(BOB.into(), DAI, 1_000_000_000 * UNITS - amount_in);
+			assert_balance!(BOB.into(), LRNA, 1_000 * UNITS);
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+			assert_balance!(BOB.into(), DOT, amount_to_buy);
+		});
+
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (stable_pool_id, stable_asset_1, stable_asset_2) = init_stableswap().unwrap();
+				create_lbp_pool(DAI, HDX);
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				create_xyk_pool(HDX, stable_asset_1);
+
+				let amount_to_buy = UNITS;
+				let limit = 100 * UNITS;
+				let trades = vec![
+					Trade {
+						pool: PoolType::LBP,
+						asset_in: DAI,
+						asset_out: HDX,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: HDX,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::Stableswap(stable_pool_id),
+						asset_in: stable_asset_1,
+						asset_out: stable_asset_2,
+					},
+				];
+
+				start_lbp_campaign();
+
+				//Act
+				assert_ok!(Router::buy(
+					RuntimeOrigin::signed(BOB.into()),
+					DAI,
+					stable_asset_2,
+					amount_to_buy,
+					limit,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				let amount_in = 3_753_549_142_038;
+
+				assert_balance!(BOB.into(), DAI, 1_000_000_000 * UNITS - amount_in);
+				assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+				assert_balance!(BOB.into(), stable_asset_1, 0);
+				assert_balance!(BOB.into(), stable_asset_2, amount_to_buy);
+
+				/*
+				expect_hydra_events(vec![
+					pallet_broadcast::Event::Swapped {
+						swapper: BOB.into(),
+						filler: LBP::get_pair_id(pallet_lbp::types::AssetPair::new(DAI, HDX)),
+						filler_type: pallet_broadcast::types::Filler::LBP,
+						operation: pallet_broadcast::types::TradeOperation::ExactOut,
+						inputs: vec![Asset::new(DAI, 3746042043754)],
+						outputs: vec![Asset::new(HDX, 2067851065323)],
+						fees: vec![Fee::new(
+							DAI,
+							7507098284,
+							Destination::Account(
+								LBP::pool_data(LBP::get_pair_id(pallet_lbp::types::AssetPair::new(DAI, HDX)))
+									.unwrap()
+									.fee_collector,
+							),
+						)],
+						operation_stack: vec![ExecutionType::Router(0)],
+					}
+					.into(),
+					pallet_broadcast::Event::Swapped {
+						swapper: BOB.into(),
+						filler: XYK::get_pair_id(pallet_xyk::types::AssetPair {
+							asset_in: HDX,
+							asset_out: stable_asset_1,
+						}),
+						filler_type: pallet_broadcast::types::Filler::XYK(XYK::share_token(XYK::get_pair_id(
+							pallet_xyk::types::AssetPair {
+								asset_in: HDX,
+								asset_out: stable_asset_1,
+							},
+						))),
+						operation: pallet_broadcast::types::TradeOperation::ExactOut,
+						inputs: vec![Asset::new(HDX, 1010010000114)],
+						outputs: vec![Asset::new(stable_asset_1, 2061666067122)],
+						fees: vec![Fee::new(
+							HDX,
+							6184998201,
+							Destination::Account(XYK::get_pair_id(pallet_xyk::types::AssetPair {
+								asset_in: HDX,
+								asset_out: stable_asset_1,
+							})),
+						)],
+						operation_stack: vec![ExecutionType::Router(0)],
+					}
+					.into(),
+					pallet_broadcast::Event::Swapped {
+						swapper: BOB.into(),
+						filler: <Runtime as pallet_stableswap::Config>::ShareAccountId::from_assets(
+							&stable_pool_id,
+							Some(pallet_stableswap::POOL_IDENTIFIER),
+						),
+						filler_type: pallet_broadcast::types::Filler::Stableswap(stable_pool_id),
+						operation: pallet_broadcast::types::TradeOperation::ExactOut,
+						inputs: vec![Asset::new(stable_asset_1, 1010010000114)],
+						outputs: vec![Asset::new(stable_asset_2, 1000000000000)],
+						fees: vec![Fee::new(
+							stable_asset_1,
+							10000099012,
+							Destination::Account(<Runtime as pallet_stableswap::Config>::ShareAccountId::from_assets(
+								&stable_pool_id,
+								Some(pallet_stableswap::POOL_IDENTIFIER),
+							)),
+						)],
+						operation_stack: vec![ExecutionType::Router(0)],
+					}
+					.into(),
+					pallet_route_executor::Event::Executed {
+						asset_in: DAI,
+						asset_out: stable_asset_2,
+						amount_in,
+						amount_out: amount_to_buy,
+						event_id: 0,
+					}
+					.into(),
+				]);
+				 */
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn multiple_trades_should_increase_event_id() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+
+			let amount_to_sell = UNITS * 2;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_sell,
+				limit,
+				BoundedVec::truncate_from(trades.clone())
+			));
+
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_sell,
+				10 * amount_to_sell,
+				BoundedVec::truncate_from(trades.clone())
+			));
+
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let swapped_events = get_last_swapped_events();
+			pretty_assertions::assert_eq!(
+				swapped_events,
+				vec![
+					pallet_broadcast::Event::Swapped3 {
+						swapper: BOB.into(),
+						filler: XYK::get_pair_id(pallet_xyk::types::AssetPair {
+							asset_in: HDX,
+							asset_out: DOT,
+						}),
+						filler_type: pallet_broadcast::types::Filler::XYK(XYK::share_token(XYK::get_pair_id(
+							pallet_xyk::types::AssetPair {
+								asset_in: HDX,
+								asset_out: DOT,
+							},
+						))),
+						operation: pallet_broadcast::types::TradeOperation::ExactIn,
+						inputs: vec![Asset::new(HDX, 2000000000000)],
+						outputs: vec![Asset::new(DOT, 977450980394)],
+						fees: vec![Fee::new(
+							DOT,
+							2941176468,
+							Destination::Account(XYK::get_pair_id(pallet_xyk::types::AssetPair {
+								asset_in: HDX,
+								asset_out: DOT,
+							})),
+						)],
+						operation_stack: vec![ExecutionType::Router(0)],
+					},
+					pallet_broadcast::Event::Swapped3 {
+						swapper: BOB.into(),
+						filler: XYK::get_pair_id(pallet_xyk::types::AssetPair {
+							asset_in: HDX,
+							asset_out: DOT,
+						}),
+						filler_type: pallet_broadcast::types::Filler::XYK(XYK::share_token(XYK::get_pair_id(
+							pallet_xyk::types::AssetPair {
+								asset_in: HDX,
+								asset_out: DOT,
+							},
+						))),
+						operation: pallet_broadcast::types::TradeOperation::ExactOut,
+						inputs: vec![Asset::new(HDX, 4338344140275)],
+						outputs: vec![Asset::new(DOT, 2000000000000)],
+						fees: vec![Fee::new(
+							HDX,
+							13015032420,
+							Destination::Account(XYK::get_pair_id(pallet_xyk::types::AssetPair {
+								asset_in: HDX,
+								asset_out: DOT,
+							})),
+						)],
+						operation_stack: vec![ExecutionType::Router(1)],
+					},
+					pallet_broadcast::Event::Swapped3 {
+						swapper: BOB.into(),
+						filler: XYK::get_pair_id(pallet_xyk::types::AssetPair {
+							asset_in: HDX,
+							asset_out: DOT,
+						}),
+						filler_type: pallet_broadcast::types::Filler::XYK(XYK::share_token(XYK::get_pair_id(
+							pallet_xyk::types::AssetPair {
+								asset_in: HDX,
+								asset_out: DOT,
+							},
+						))),
+						operation: pallet_broadcast::types::TradeOperation::ExactIn,
+						inputs: vec![Asset::new(HDX, 2000000000000)],
+						outputs: vec![Asset::new(DOT, 865360282152)],
+						fees: vec![Fee::new(
+							DOT,
+							2603892522,
+							Destination::Account(XYK::get_pair_id(pallet_xyk::types::AssetPair {
+								asset_in: HDX,
+								asset_out: DOT,
+							})),
+						)],
+						operation_stack: vec![ExecutionType::Router(2)],
+					}
+				]
+			);
+		});
+	}
+
+	#[test]
+	fn account_should_not_have_dust_when_selling_share_asset_with_dust_leftover() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				let some_dust = 9;
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					ALICE.into(),
+					pool_id,
+					100 * UNITS + some_dust
+				));
+				let trades = vec![Trade {
+					pool: PoolType::Stableswap(pool_id),
+					asset_in: pool_id,
+					asset_out: stable_asset_1,
+				}];
+
+				//Act
+				let amount_to_sell = 100 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					pool_id,
+					stable_asset_1,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert that no dust left on account
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(pool_id, &AccountId::from(ALICE)),
+					0
+				);
+
+				//Assert that dust is transferred to treasury
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(pool_id, &Treasury::account_id()),
+					some_dust
+				);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn router_should_work_for_hopping_from_omnipool_to_stableswap() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, stable_asset_2) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					stable_asset_1,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: stable_asset_1,
+						asset_out: stable_asset_2,
+					},
+				];
+
+				//Act
+				let amount_to_sell = 100 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					stable_asset_2,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_eq!(
+					hydradx_runtime::Balances::free_balance(AccountId::from(ALICE)),
+					ALICE_INITIAL_NATIVE_BALANCE - amount_to_sell
+				);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	use hydradx_runtime::Router;
+	use orml_traits::MultiReservableCurrency;
+
+	#[test]
+	fn sell_router_should_add_liquidity_to_stableswap_when_selling_for_shareasset_in_stableswap() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					stable_asset_1,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: stable_asset_1,
+						asset_out: pool_id,
+					},
+				];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+
+				//Act
+				let amount_to_sell = 100 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					pool_id,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_eq!(
+					hydradx_runtime::Balances::free_balance(AccountId::from(ALICE)),
+					ALICE_INITIAL_NATIVE_BALANCE - amount_to_sell
+				);
+
+				assert_balance!(ALICE.into(), pool_id, 4638992258357);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_router_with_stableshares_adding_liquidity_fails_when_deposit_limiter_triggered() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					stable_asset_1,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: stable_asset_1,
+						asset_out: pool_id,
+					},
+				];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+
+				//Act
+				let amount_to_sell = 100 * UNITS;
+				let deposit_limit = UNITS;
+				crate::deposit_limiter::update_deposit_limit(pool_id, deposit_limit).unwrap();
+
+				//Act and assert
+				assert_noop!(
+					Router::sell(
+						hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+						HDX,
+						pool_id,
+						amount_to_sell,
+						4538992258357,
+						trades.try_into().unwrap()
+					),
+					pallet_circuit_breaker::Error::<Runtime>::DepositLimitExceededForWhitelistedAccount
+				);
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+				assert_reserved_balance!(&Router::router_account(), pool_id, 0);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_router_fails_when_deposit_limit_exceeded_in_router_context() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					stable_asset_1,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: stable_asset_1,
+						asset_out: pool_id,
+					},
+				];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+				let alice_hdx_before = Currencies::free_balance(HDX, &ALICE.into());
+
+				//Act
+				let amount_to_sell = 100 * UNITS;
+				let deposit_limit = UNITS;
+				crate::deposit_limiter::update_deposit_limit(pool_id, deposit_limit).unwrap();
+
+				//Act
+				assert_noop!(
+					Router::sell(
+						hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+						HDX,
+						pool_id,
+						amount_to_sell,
+						0,
+						trades.try_into().unwrap()
+					),
+					pallet_circuit_breaker::Error::<hydradx_runtime::Runtime>::DepositLimitExceededForWhitelistedAccount
+				);
+
+				// Verify that nothing has changed
+				assert_balance!(ALICE.into(), pool_id, 0);
+				assert_balance!(ALICE.into(), HDX, alice_hdx_before);
+				assert_reserved_balance!(&Router::router_account(), pool_id, 0);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn buy_router_fails_when_deposit_limit_exceeded_in_router_context() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				// Arrange - Same setup as the sell test
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				// Add stable_asset_1 to Omnipool (NOT pool_id - we want minting at END)
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					stable_asset_1,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				// Route: HDX -> stable_asset_1 (Omnipool) -> pool_id (Stableswap mint at END!)
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: stable_asset_1,
+						asset_out: pool_id, // Minting shares at the END
+					},
+				];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					HDX,
+					100_000 * UNITS as i128,
+				));
+
+				let alice_hdx_before = Currencies::free_balance(HDX, &ALICE.into());
+
+				let amount_to_buy = 100 * UNITS;
+				let deposit_limit = UNITS;
+				crate::deposit_limiter::update_deposit_limit(pool_id, deposit_limit).unwrap();
+
+				// Act
+				assert_noop!(
+					Router::buy(
+						hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+						HDX,
+						pool_id,
+						amount_to_buy,
+						2_500 * UNITS,
+						trades.try_into().unwrap()
+					),
+					pallet_circuit_breaker::Error::<hydradx_runtime::Runtime>::DepositLimitExceededForWhitelistedAccount
+				);
+
+				// Verify nothing changed and locked
+				assert_balance!(ALICE.into(), pool_id, 0);
+				assert_balance!(ALICE.into(), HDX, alice_hdx_before);
+				assert_reserved_balance!(&Router::router_account(), pool_id, 0);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn router_should_remove_liquidity_from_stableswap_when_selling_shareasset_in_stable() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: pool_id,
+						asset_out: stable_asset_1,
+					},
+				];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+
+				//Act
+				let amount_to_sell = 100 * UNITS;
+
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					stable_asset_1,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_balance!(ALICE.into(), pool_id, 0);
+				assert_balance!(ALICE.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE - amount_to_sell);
+				assert_balance!(ALICE.into(), stable_asset_1, 4638992106950);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn buy_router_should_remove_liquidity_from_stableswap_when_asset_in_is_shareasset() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: pool_id,
+						asset_out: stable_asset_1,
+					},
+				];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+
+				//Act
+				let amount_to_buy = UNITS;
+
+				assert_ok!(Router::buy(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					stable_asset_1,
+					amount_to_buy,
+					u128::MAX,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				//assert_balance!(ALICE.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE);
+				assert_balance!(ALICE.into(), stable_asset_1, amount_to_buy);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn buy_router_should_add_liquidity_from_stableswap_when_asset_out_is_share_asset_in_stable() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: stable_asset_1,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: pool_id,
+						asset_out: HDX,
+					},
+				];
+
+				assert_balance!(ALICE.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE);
+
+				//Act
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				let amount_to_buy = 100 * UNITS;
+
+				assert_ok!(Router::buy(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					stable_asset_1,
+					HDX,
+					amount_to_buy,
+					u128::MAX,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_balance!(ALICE.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE + amount_to_buy);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn trade_should_return_correct_weight() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+
+			let trades = vec![
+				Trade {
+					pool: PoolType::Omnipool,
+					asset_in: DAI,
+					asset_out: ACA,
+				},
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: ACA,
+					asset_out: DOT,
+				},
+			];
+
+			//Act & Assert
+			assert_eq!(
+				RouterWeightInfo::sell_weight(trades.as_slice()),
+				hydradx_runtime::weights::pallet_omnipool::HydraWeight::<Runtime>::router_execution_sell(0, 1)
+					.checked_add(&<Runtime as pallet_omnipool::Config>::OmnipoolHooks::on_trade_weight())
+					.unwrap()
+					.checked_add(&<Runtime as pallet_omnipool::Config>::OmnipoolHooks::on_liquidity_changed_weight())
+					.unwrap()
+					.checked_add(
+						&hydradx_runtime::weights::pallet_lbp::HydraWeight::<Runtime>::router_execution_sell(0, 1)
+					)
+					.unwrap()
+					.checked_add(
+						&RouterWeightInfo::sell_and_calculate_sell_trade_amounts_overhead_weight(0, 1)
+							.checked_mul(2)
+							.unwrap()
+					)
+					.unwrap()
+			);
+			assert_eq!(
+				RouterWeightInfo::buy_weight(trades.as_slice()),
+				hydradx_runtime::weights::pallet_omnipool::HydraWeight::<Runtime>::router_execution_buy(1, 1)
+					.checked_add(&<Runtime as pallet_omnipool::Config>::OmnipoolHooks::on_trade_weight())
+					.unwrap()
+					.checked_add(&<Runtime as pallet_omnipool::Config>::OmnipoolHooks::on_liquidity_changed_weight())
+					.unwrap()
+					.checked_add(
+						&hydradx_runtime::weights::pallet_lbp::HydraWeight::<Runtime>::router_execution_buy(1, 1)
+					)
+					.unwrap()
+					.checked_add(
+						&RouterWeightInfo::buy_and_calculate_buy_trade_amounts_overhead_weight(0, 1)
+							.checked_mul(2)
+							.unwrap()
+					)
+					.unwrap()
+			);
+		});
+	}
+}
+
+mod omnipool_router_tests {
+	use super::*;
+	use frame_support::assert_noop;
+	use hydradx_runtime::{Omnipool, XYK};
+	use hydradx_traits::router::PoolType;
+	use hydradx_traits::AssetKind;
+	use pallet_broadcast::types::{Destination, ExecutionType};
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn sell_should_work_when_route_contains_single_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 266461932256168358;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_user_has_left_less_than_existential_in_nonnative() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				let init_balance = 3000 * UNITS + 1;
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					stable_asset_1,
+					init_balance as i128,
+				));
+
+				let trades = vec![Trade {
+					pool: PoolType::Stableswap(pool_id),
+					asset_in: stable_asset_1,
+					asset_out: pool_id,
+				}];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+
+				//Act
+				let amount_to_sell = 3000 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					stable_asset_1,
+					pool_id,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(stable_asset_1, &AccountId::from(ALICE)),
+					0
+				);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_all_asset_in_spent_for_altcoin() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let name = b"SHITCO".to_vec();
+				let altcoin = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+				assert_ok!(Currencies::deposit(altcoin, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DAVE.into(),
+					HDX,
+					100000 * UNITS as i128,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					HDX,
+					100000 * UNITS,
+					altcoin,
+					100000 * UNITS,
+				));
+
+				let trades = vec![Trade {
+					pool: PoolType::XYK,
+					asset_in: HDX,
+					asset_out: altcoin,
+				}];
+
+				//Act
+				let amount_to_sell = ALICE_INITIAL_NATIVE_BALANCE;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					altcoin,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_eq!(Currencies::free_balance(HDX, &AccountId::from(ALICE)), 0);
+				assert_eq!(
+					Currencies::free_balance(altcoin, &AccountId::from(ALICE)),
+					987_128_712_871_290
+				);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_pass_when_user_has_asset_in_covering_the_fee_for_altcoin() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let name = b"SHITCO".to_vec();
+				let altcoin = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				assert_ok!(Currencies::deposit(altcoin, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DAVE.into(),
+					HDX,
+					100000 * UNITS as i128,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					HDX,
+					100000 * UNITS,
+					altcoin,
+					100000 * UNITS,
+				));
+
+				let trades = vec![Trade {
+					pool: PoolType::XYK,
+					asset_in: HDX,
+					asset_out: altcoin,
+				}];
+
+				//Act
+				let amount_to_sell = ALICE_INITIAL_NATIVE_BALANCE - 20 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					altcoin,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_not_charge_ed_when_insufficient_in_middle_of_route() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let name = b"INSUFF".to_vec();
+				let insufficient_asset = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				assert_ok!(Currencies::deposit(ETH, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::deposit(DOT, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::deposit(insufficient_asset, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DAVE.into(),
+					HDX,
+					10000 * UNITS as i128,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					HDX,
+					10000 * UNITS,
+					DOT,
+					10000 * UNITS,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					DOT,
+					10000 * UNITS,
+					insufficient_asset,
+					10000 * UNITS,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					insufficient_asset,
+					10000 * UNITS,
+					ETH,
+					10000 * UNITS,
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: HDX,
+						asset_out: DOT,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: DOT,
+						asset_out: insufficient_asset,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: insufficient_asset,
+						asset_out: ETH,
+					},
+				];
+
+				//Act
+				assert_balance!(ALICE.into(), HDX, 1000 * UNITS);
+
+				let amount_to_sell = 20 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					ETH,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				assert_balance!(ALICE.into(), HDX, 1000 * UNITS - amount_to_sell);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_work_with_only_insufficient_assets() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let name = b"INSUF1".to_vec();
+				let insufficient_asset1 = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				let name = b"INSUF2".to_vec();
+				let insufficient_asset2 = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				let name = b"INSUF3".to_vec();
+				let insufficient_asset3 = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				let name = b"INSUF4".to_vec();
+				let insufficient_asset4 = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				assert_ok!(Currencies::deposit(insufficient_asset1, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::deposit(insufficient_asset2, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::deposit(insufficient_asset3, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::deposit(insufficient_asset4, &DAVE.into(), 100000 * UNITS,));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					insufficient_asset1,
+					10000 * UNITS,
+					insufficient_asset2,
+					10000 * UNITS,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					insufficient_asset2,
+					10000 * UNITS,
+					insufficient_asset3,
+					10000 * UNITS,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					insufficient_asset3,
+					10000 * UNITS,
+					insufficient_asset4,
+					10000 * UNITS,
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: insufficient_asset1,
+						asset_out: insufficient_asset2,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: insufficient_asset2,
+						asset_out: insufficient_asset3,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: insufficient_asset3,
+						asset_out: insufficient_asset4,
+					},
+				];
+
+				assert_ok!(Currencies::deposit(insufficient_asset1, &ALICE.into(), 1500 * UNITS,));
+
+				assert_balance!(ALICE.into(), HDX, 1000 * UNITS);
+
+				let amount_to_sell = 20 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					insufficient_asset1,
+					insufficient_asset4,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				assert_balance!(ALICE.into(), HDX, 1000 * UNITS);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn buy_should_work_with_only_insufficient_assets() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let name = b"INSUF1".to_vec();
+				let insufficient_asset1 = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				let name = b"INSUF2".to_vec();
+				let insufficient_asset2 = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				let name = b"INSUF3".to_vec();
+				let insufficient_asset3 = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				let name = b"INSUF4".to_vec();
+				let insufficient_asset4 = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				assert_ok!(Currencies::deposit(insufficient_asset1, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::deposit(insufficient_asset2, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::deposit(insufficient_asset3, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::deposit(insufficient_asset4, &DAVE.into(), 100000 * UNITS,));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					insufficient_asset1,
+					10000 * UNITS,
+					insufficient_asset2,
+					10000 * UNITS,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					insufficient_asset2,
+					10000 * UNITS,
+					insufficient_asset3,
+					10000 * UNITS,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					insufficient_asset3,
+					10000 * UNITS,
+					insufficient_asset4,
+					10000 * UNITS,
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: insufficient_asset1,
+						asset_out: insufficient_asset2,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: insufficient_asset2,
+						asset_out: insufficient_asset3,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: insufficient_asset3,
+						asset_out: insufficient_asset4,
+					},
+				];
+
+				assert_ok!(Currencies::deposit(insufficient_asset1, &ALICE.into(), 1500 * UNITS,));
+
+				assert_balance!(ALICE.into(), HDX, 1000 * UNITS);
+
+				let amount_to_buy = 20 * UNITS;
+				assert_ok!(Router::buy(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					insufficient_asset1,
+					insufficient_asset4,
+					amount_to_buy,
+					u128::MAX,
+					trades.try_into().unwrap()
+				));
+
+				assert_balance!(ALICE.into(), HDX, 1000 * UNITS);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_receiving_shitcoin() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let name = b"SHITC1".to_vec();
+				let shitcoin = AssetRegistry::register_insufficient_asset(
+					None,
+					Some(name.try_into().unwrap()),
+					AssetKind::External,
+					Some(1_000),
+					None,
+					None,
+					None,
+					None,
+				)
+				.unwrap();
+
+				assert_ok!(Currencies::deposit(shitcoin, &DAVE.into(), 100000 * UNITS,));
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DAVE.into(),
+					HDX,
+					100000 * UNITS as i128,
+				));
+
+				assert_ok!(XYK::create_pool(
+					RuntimeOrigin::signed(DAVE.into()),
+					HDX,
+					100000 * UNITS,
+					shitcoin,
+					100000 * UNITS,
+				));
+
+				let trades = vec![Trade {
+					pool: PoolType::XYK,
+					asset_in: HDX,
+					asset_out: shitcoin,
+				}];
+
+				//Act
+				let amount_to_sell = ALICE_INITIAL_NATIVE_BALANCE - 20 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					shitcoin,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_user_has_left_less_than_existential_in_native() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			assert_ok!(Currencies::update_balance(
+				hydradx_runtime::RuntimeOrigin::root(),
+				ALICE.into(),
+				HDX,
+				2 * UNITS as i128,
+			));
+
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act and assert
+			let amount_to_sell = ALICE_INITIAL_NATIVE_BALANCE;
+			assert_ok!(Router::sell(
+				hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+				HDX,
+				DAI,
+				amount_to_sell,
+				0,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			assert_eq!(
+				hydradx_runtime::Currencies::free_balance(HDX, &AccountId::from(ALICE)),
+				2 * UNITS
+			);
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_account_providers_increases_during_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			let _ = with_transaction(|| {
+				// deeper initial liquidity so BOB's LP shares cover the omnipool token seed below
+				let (pool_id, stable_asset_1, _stable_asset_2) =
+					init_stableswap_with_details(20_000_000_000_000_000u128, 300_000_000_000_000u128, 18).unwrap();
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					60000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					HDX,
+					2 * UNITS as i128,
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: pool_id,
+						asset_out: stable_asset_1,
+					},
+				];
+
+				//We need to do this because this setup leads to different behaviour of reducable_balance in the post balance check in router
+				hydradx_runtime::System::inc_consumers(&AccountId::from(ALICE)).unwrap();
+				let acc = hydradx_runtime::System::account(AccountId::from(ALICE));
+				assert_eq!(acc.consumers, 1);
+				hydradx_runtime::System::dec_providers(&AccountId::from(ALICE)).unwrap();
+				hydradx_runtime::System::dec_providers(&AccountId::from(ALICE)).unwrap();
+				hydradx_runtime::System::dec_providers(&AccountId::from(ALICE)).unwrap();
+				let acc = hydradx_runtime::System::account(AccountId::from(ALICE));
+				assert_eq!(acc.providers, 1);
+
+				//Act and assert
+				let amount_to_sell = ALICE_INITIAL_NATIVE_BALANCE;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					stable_asset_1,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(HDX, &AccountId::from(ALICE)),
+					2 * UNITS
+				);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_work_with_selling_nonnaitve_when_account_providers_increases_during_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			let _ = with_transaction(|| {
+				// deeper initial liquidity so BOB's LP shares cover the omnipool token seed below
+				let (pool_id, stable_asset_1, _stable_asset_2) =
+					init_stableswap_with_details(20_000_000_000_000_000u128, 300_000_000_000_000u128, 18).unwrap();
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					60000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					DAI,
+					2 * UNITS as i128,
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: DAI,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: pool_id,
+						asset_out: stable_asset_1,
+					},
+				];
+
+				//We need to do this because this setup leads to different behaviour of reducable_balance in the post balance check in router
+				hydradx_runtime::System::inc_consumers(&AccountId::from(ALICE)).unwrap();
+				let acc = hydradx_runtime::System::account(AccountId::from(ALICE));
+				assert_eq!(acc.consumers, 1);
+				hydradx_runtime::System::dec_providers(&AccountId::from(ALICE)).unwrap();
+				hydradx_runtime::System::dec_providers(&AccountId::from(ALICE)).unwrap();
+				hydradx_runtime::System::dec_providers(&AccountId::from(ALICE)).unwrap();
+				let acc = hydradx_runtime::System::account(AccountId::from(ALICE));
+				assert_eq!(acc.providers, 1);
+
+				//Act and assert
+				let amount_to_sell = ALICE_INITIAL_DAI_BALANCE;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					DAI,
+					stable_asset_1,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(DAI, &AccountId::from(ALICE)),
+					2 * UNITS
+				);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_hub_asset_should_work_when_route_contains_single_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: LRNA,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				LRNA,
+				DAI,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 220685840707964601769;
+
+			assert_balance!(BOB.into(), LRNA, 1_000 * UNITS - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: LRNA,
+				asset_out: DAI,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn direct_sell_should_yield_the_same_result_as_router() {
+		TestNet::reset();
+
+		let amount_to_sell = 10 * UNITS;
+		let limit = 0;
+		let amount_out = 266195070030573798;
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_out);
+
+			let swapped_events = get_last_swapped_events();
+
+			pretty_assertions::assert_eq!(
+				swapped_events,
+				vec![
+					pallet_broadcast::Event::Swapped3 {
+						swapper: BOB.into(),
+						filler: Omnipool::protocol_account(),
+						filler_type: pallet_broadcast::types::Filler::Omnipool,
+						operation: pallet_broadcast::types::TradeOperation::ExactIn,
+						inputs: vec![Asset::new(HDX, amount_to_sell)],
+						outputs: vec![Asset::new(LRNA, 12014871681)],
+						fees: vec![Fee::new(
+							LRNA,
+							6007435,
+							Destination::Account(Omnipool::protocol_account())
+						),],
+						operation_stack: vec![ExecutionType::Router(0), ExecutionType::Omnipool(1)],
+					},
+					pallet_broadcast::Event::Swapped3 {
+						swapper: BOB.into(),
+						filler: Omnipool::protocol_account(),
+						filler_type: pallet_broadcast::types::Filler::Omnipool,
+						operation: pallet_broadcast::types::TradeOperation::ExactIn,
+						inputs: vec![Asset::new(LRNA, 12_008_864_246)],
+						outputs: vec![Asset::new(DAI, amount_out)],
+						fees: vec![
+							Fee::new(DAI, 366935560192521, Destination::Account(Omnipool::protocol_account()),),
+							Fee::new(
+								DAI,
+								300220003793880,
+								Destination::Account(FeeProcessor::pot_account_id()),
+							),
+						],
+						operation_stack: vec![ExecutionType::Router(0), ExecutionType::Omnipool(1)],
+					}
+				]
+			);
+		});
+
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			//Act
+			assert_ok!(Omnipool::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_sell,
+				limit,
+			));
+
+			//Assert
+			expect_hydra_last_events(vec![
+				pallet_omnipool::Event::SellExecuted {
+					who: BOB.into(),
+					asset_in: HDX,
+					asset_out: DAI,
+					amount_in: amount_to_sell,
+					amount_out,
+					hub_amount_in: 12014871681,
+					hub_amount_out: 12025376523,
+					asset_fee_amount: 667155563986401,
+					protocol_fee_amount: 6_007_435,
+				}
+				.into(),
+				pallet_broadcast::Event::Swapped3 {
+					swapper: BOB.into(),
+					filler: Omnipool::protocol_account(),
+					filler_type: pallet_broadcast::types::Filler::Omnipool,
+					operation: pallet_broadcast::types::TradeOperation::ExactIn,
+					inputs: vec![Asset::new(HDX, amount_to_sell)],
+					outputs: vec![Asset::new(LRNA, 12_014_871_681)],
+					fees: vec![Fee::new(
+						LRNA,
+						6007435,
+						Destination::Account(Omnipool::protocol_account()),
+					)],
+
+					operation_stack: vec![ExecutionType::Omnipool(0)],
+				}
+				.into(),
+				pallet_broadcast::Event::Swapped3 {
+					swapper: BOB.into(),
+					filler: Omnipool::protocol_account(),
+					filler_type: pallet_broadcast::types::Filler::Omnipool,
+					operation: pallet_broadcast::types::TradeOperation::ExactIn,
+					inputs: vec![Asset::new(LRNA, 12_008_864_246)],
+					outputs: vec![Asset::new(DAI, amount_out)],
+					fees: vec![
+						Fee::new(DAI, 366935560192521, Destination::Account(Omnipool::protocol_account())),
+						Fee::new(
+							DAI,
+							300220003793880,
+							Destination::Account(FeeProcessor::pot_account_id()),
+						),
+					],
+					operation_stack: vec![ExecutionType::Omnipool(0)],
+				}
+				.into(),
+			]);
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_out);
+		});
+	}
+
+	#[test]
+	fn buy_should_work_when_route_contains_single_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let amount_to_buy = UNITS * 100000;
+			let limit = 100 * UNITS;
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 3756606010477;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn buy_should_work_when_after_trade_reamining_balance_is_less_than_existential_deposit() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let amount_to_buy = 26559360000000000000u128;
+
+			let limit = ALICE_INITIAL_NATIVE_BALANCE;
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+		});
+	}
+
+	#[test]
+	fn buy_hub_asset_should_not_work() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let amount_to_buy = UNITS;
+			let limit = 100 * UNITS;
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: LRNA,
+			}];
+
+			//Act & Assert
+			assert_noop!(
+				Router::buy(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					LRNA,
+					amount_to_buy,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_omnipool::Error::<Runtime>::NotAllowed
+			);
+		});
+	}
+
+	#[test]
+	fn direct_buy_should_yield_the_same_result_as_router() {
+		TestNet::reset();
+
+		let amount_to_buy = UNITS * 100000;
+		let limit = 100 * UNITS;
+		let amount_in = 3756606010477;
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+
+			let last_swapped_events = get_last_swapped_events();
+			pretty_assertions::assert_eq!(
+				last_swapped_events,
+				vec![
+					pallet_broadcast::Event::Swapped3 {
+						swapper: BOB.into(),
+						filler: Omnipool::protocol_account(),
+						filler_type: pallet_broadcast::types::Filler::Omnipool,
+						operation: pallet_broadcast::types::TradeOperation::ExactOut,
+						inputs: vec![Asset::new(HDX, amount_in)],
+						outputs: vec![Asset::new(LRNA, 4513544013)],
+						fees: vec![Fee::new(
+							LRNA,
+							2256772,
+							Destination::Account(Omnipool::protocol_account())
+						),],
+						operation_stack: vec![ExecutionType::Router(0), ExecutionType::Omnipool(1)],
+					},
+					pallet_broadcast::Event::Swapped3 {
+						swapper: BOB.into(),
+						filler: Omnipool::protocol_account(),
+						filler_type: pallet_broadcast::types::Filler::Omnipool,
+						operation: pallet_broadcast::types::TradeOperation::ExactOut,
+						inputs: vec![Asset::new(LRNA, 4511287241)],
+						outputs: vec![Asset::new(DAI, amount_to_buy)],
+						fees: vec![
+							Fee::new(DAI, 137844611528823, Destination::Account(Omnipool::protocol_account()),),
+							Fee::new(
+								DAI,
+								112781954887218,
+								Destination::Account(FeeProcessor::pot_account_id()),
+							),
+						],
+						operation_stack: vec![ExecutionType::Router(0), ExecutionType::Omnipool(1)],
+					}
+				]
+			);
+		});
+
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			//Act
+			assert_ok!(Omnipool::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				DAI,
+				HDX,
+				amount_to_buy,
+				limit,
+			));
+
+			//Assert
+			expect_hydra_last_events(vec![
+				pallet_omnipool::Event::BuyExecuted {
+					who: BOB.into(),
+					asset_in: HDX,
+					asset_out: DAI,
+					amount_in,
+					amount_out: amount_to_buy,
+					hub_amount_in: 4513544013,
+					hub_amount_out: 4517490274,
+					asset_fee_amount: 250626566416041,
+					protocol_fee_amount: 2256772,
+				}
+				.into(),
+				pallet_broadcast::Event::Swapped3 {
+					swapper: BOB.into(),
+					filler: Omnipool::protocol_account(),
+					filler_type: pallet_broadcast::types::Filler::Omnipool,
+					operation: pallet_broadcast::types::TradeOperation::ExactOut,
+					inputs: vec![Asset::new(HDX, amount_in)],
+					outputs: vec![Asset::new(LRNA, 4513544013)],
+					fees: vec![Fee::new(
+						LRNA,
+						2256772,
+						Destination::Account(Omnipool::protocol_account()),
+					)],
+					operation_stack: vec![ExecutionType::Omnipool(0)],
+				}
+				.into(),
+				pallet_broadcast::Event::Swapped3 {
+					swapper: BOB.into(),
+					filler: Omnipool::protocol_account(),
+					filler_type: pallet_broadcast::types::Filler::Omnipool,
+					operation: pallet_broadcast::types::TradeOperation::ExactOut,
+					inputs: vec![Asset::new(LRNA, 4511287241)],
+					outputs: vec![Asset::new(DAI, amount_to_buy)],
+					fees: vec![
+						Fee::new(DAI, 137844611528823, Destination::Account(Omnipool::protocol_account())),
+						Fee::new(
+							DAI,
+							112781954887218,
+							Destination::Account(FeeProcessor::pot_account_id()),
+						),
+					],
+					operation_stack: vec![ExecutionType::Omnipool(0)],
+				}
+				.into(),
+			]);
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+		});
+	}
+
+	#[test]
+	fn trade_should_fail_when_asset_is_not_in_omnipool() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: DAI,
+				asset_out: ACA,
+			}];
+
+			//Act & Assert
+			assert_noop!(
+				Router::sell(
+					RuntimeOrigin::signed(BOB.into()),
+					DAI,
+					ACA,
+					amount_to_sell,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_omnipool::Error::<Runtime>::AssetNotFound
+			);
+		});
+	}
+}
+
+mod lbp_router_tests {
+	use super::*;
+	use crate::assert_balance;
+	use pallet_broadcast::types::{Asset, Destination, Fee};
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn sell_should_work_when_route_contains_single_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::LBP,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 5_304_848_794_461;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_selling_distributed_asset_in_a_single_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::LBP,
+				asset_in: DAI,
+				asset_out: HDX,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				DAI,
+				HDX,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 15_853_064_919_440;
+
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE + amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: DAI,
+				asset_out: HDX,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn sell_should_work_when_route_contains_double_trades_with_selling_accumulated_assets() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			create_lbp_pool(DAI, DOT);
+			start_lbp_campaign();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: HDX,
+					asset_out: DAI,
+				},
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: DAI,
+					asset_out: DOT,
+				},
+			];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 2_894_653_623_153;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE);
+			assert_balance!(BOB.into(), DOT, amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DOT,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_route_contains_double_trades_with_selling_distributed_assets() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(DAI, HDX);
+			create_lbp_pool(DOT, DAI);
+			start_lbp_campaign();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: HDX,
+					asset_out: DAI,
+				},
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: DAI,
+					asset_out: DOT,
+				},
+			];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 23_648_944_192_390;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE);
+			assert_balance!(BOB.into(), DOT, amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DOT,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn lbp_direct_sell_should_yield_the_same_result_as_router_sell() {
+		TestNet::reset();
+
+		let amount_to_sell = 10 * UNITS;
+		let limit = 0;
+		let received_amount_out = 5_304_848_794_461;
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			let trades = vec![Trade {
+				pool: PoolType::LBP,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + received_amount_out);
+
+			let fee = 20000000000;
+
+			pretty_assertions::assert_eq!(
+				*get_last_swapped_events().last().unwrap(),
+				pallet_broadcast::Event::<Runtime>::Swapped3 {
+					swapper: BOB.into(),
+					filler: LBP::get_pair_id(pallet_lbp::types::AssetPair::new(DAI, HDX)),
+					filler_type: pallet_broadcast::types::Filler::LBP,
+					operation: pallet_broadcast::types::TradeOperation::ExactIn,
+					inputs: vec![Asset::new(HDX, amount_to_sell - fee)],
+					outputs: vec![Asset::new(DAI, received_amount_out)],
+					fees: vec![Fee::new(
+						HDX,
+						fee,
+						Destination::Account(
+							LBP::pool_data(LBP::get_pair_id(pallet_lbp::types::AssetPair::new(HDX, DAI)))
+								.unwrap()
+								.fee_collector,
+						),
+					)],
+					operation_stack: vec![ExecutionType::Router(0)],
+				}
+			);
+		});
+
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			//Act
+			assert_ok!(LBP::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_sell,
+				limit
+			));
+
+			//Assert
+			expect_hydra_last_events(vec![
+				pallet_lbp::Event::SellExecuted {
+					who: BOB.into(),
+					asset_in: HDX,
+					asset_out: DAI,
+					amount: 9_980_000_000_000,
+					sale_price: received_amount_out,
+					fee_asset: HDX,
+					fee_amount: 20_000_000_000,
+				}
+				.into(),
+				pallet_broadcast::Event::Swapped3 {
+					swapper: BOB.into(),
+					filler: LBP::get_pair_id(pallet_lbp::types::AssetPair::new(DAI, HDX)),
+					filler_type: pallet_broadcast::types::Filler::LBP,
+					operation: pallet_broadcast::types::TradeOperation::ExactIn,
+					inputs: vec![Asset::new(HDX, 9_980_000_000_000)],
+					outputs: vec![Asset::new(DAI, received_amount_out)],
+					fees: vec![Fee::new(
+						HDX,
+						20_000_000_000,
+						Destination::Account(
+							LBP::pool_data(LBP::get_pair_id(pallet_lbp::types::AssetPair::new(HDX, DAI)))
+								.unwrap()
+								.fee_collector,
+						),
+					)],
+					operation_stack: vec![],
+				}
+				.into(),
+			]);
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + received_amount_out);
+		});
+	}
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn buy_should_work_when_when_buying_distributed_asset() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			let amount_to_buy = 10 * UNITS;
+			let limit = 100 * UNITS;
+			let trades = vec![Trade {
+				pool: PoolType::LBP,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 19_944_391_321_918;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn buy_should_work_when_buying_accumulated_asset_in_a_single_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			let amount_to_buy = 10 * UNITS;
+			let limit = 100 * UNITS;
+			let trades = vec![Trade {
+				pool: PoolType::LBP,
+				asset_in: DAI,
+				asset_out: HDX,
+			}];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				DAI,
+				HDX,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 6_045_520_997_664;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE + amount_to_buy);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE - amount_in);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: DAI,
+				asset_out: HDX,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn buy_should_work_when_having_double_trades_with_buying_distributed_asset() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			create_lbp_pool(DAI, DOT);
+			start_lbp_campaign();
+
+			let amount_to_buy = UNITS;
+			let limit = 100 * UNITS;
+			let trades = vec![
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: HDX,
+					asset_out: DAI,
+				},
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: DAI,
+					asset_out: DOT,
+				},
+			];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 3_244_461_218_396;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE);
+			assert_balance!(BOB.into(), DOT, amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DOT,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn buy_should_work_when_having_double_trades_with_buying_accumulated_asset() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(DAI, HDX);
+			create_lbp_pool(DOT, DAI);
+			start_lbp_campaign();
+
+			let amount_to_buy = UNITS;
+			let limit = 100 * UNITS;
+			let trades = vec![
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: HDX,
+					asset_out: DAI,
+				},
+				Trade {
+					pool: PoolType::LBP,
+					asset_in: DAI,
+					asset_out: DOT,
+				},
+			];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 322_733_757_240;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE);
+			assert_balance!(BOB.into(), DOT, amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DOT,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn lbp_direct_buy_should_yield_the_same_result_as_router_buy() {
+		TestNet::reset();
+
+		let amount_to_buy = 10 * UNITS;
+		let limit = 100 * UNITS;
+		let spent_amount_in = 19_944_391_321_918;
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			let trades = vec![Trade {
+				pool: PoolType::LBP,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - spent_amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in: spent_amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			//Act
+			assert_ok!(LBP::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				DAI,
+				HDX,
+				amount_to_buy,
+				limit
+			));
+
+			//Assert
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - spent_amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+		});
+	}
+
+	#[test]
+	fn trade_should_fail_when_asset_is_not_in_lbp() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DAI);
+			start_lbp_campaign();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::LBP,
+				asset_in: DAI,
+				asset_out: ACA,
+			}];
+
+			//Act & Assert
+			assert_noop!(
+				Router::sell(
+					RuntimeOrigin::signed(BOB.into()),
+					DAI,
+					ACA,
+					amount_to_sell,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_lbp::Error::<Runtime>::PoolNotFound
+			);
+		});
+	}
+}
+
+mod xyk_router_tests {
+	use super::*;
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn sell_should_work_when_route_contains_single_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+			assert_balance!(BOB.into(), DOT, 0);
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 4_531_818_181_819_u128;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DOT, amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DOT,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn sell_should_work_when_route_contains_multiple_trades() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, LRNA);
+			create_xyk_pool(LRNA, DAI);
+			create_xyk_pool(DAI, DOT);
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+			assert_balance!(BOB.into(), LRNA, BOB_INITIAL_LRNA_BALANCE);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE);
+			assert_balance!(BOB.into(), DOT, 0);
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+			let trades = vec![
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: HDX,
+					asset_out: LRNA,
+				},
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: LRNA,
+					asset_out: DAI,
+				},
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: DAI,
+					asset_out: DOT,
+				},
+			];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_sell,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_out = 1_054_553_059_484_u128;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), LRNA, BOB_INITIAL_LRNA_BALANCE);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE);
+			assert_balance!(BOB.into(), DOT, amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DOT,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn sell_should_fail_when_there_is_no_pool_for_specific_asset_pair() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+
+			let amount_to_sell = 10;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act and Assert
+			assert_noop!(
+				Router::sell(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					DAI,
+					amount_to_sell * UNITS,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_xyk::Error::<hydradx_runtime::Runtime>::TokenPoolNotFound
+			);
+		});
+	}
+
+	#[test]
+	fn sell_should_fail_when_balance_is_not_sufficient() {
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+
+			let amount_to_sell = 9999 * UNITS;
+
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act and Assert
+			assert_noop!(
+				Router::sell(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					DOT,
+					amount_to_sell * UNITS,
+					0,
+					trades.try_into().unwrap()
+				),
+				sp_runtime::TokenError::FundsUnavailable
+			);
+		});
+	}
+
+	#[test]
+	fn sell_should_fail_when_trading_limit_is_below_minimum() {
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+
+			let amount_to_sell = hydradx_runtime::MinTradingLimit::get() - 1;
+			let limit = 0;
+
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act and Assert
+			assert_noop!(
+				Router::sell(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					DOT,
+					amount_to_sell,
+					limit,
+					trades.try_into().unwrap()
+				),
+				sp_runtime::TokenError::BelowMinimum
+			);
+		});
+	}
+
+	#[test]
+	fn sell_should_fail_when_buying_more_than_max_in_ratio_out() {
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+
+			let amount_to_sell = 1000 * UNITS;
+			let limit = 0;
+
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act and Assert
+			assert_noop!(
+				Router::sell(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					DOT,
+					amount_to_sell,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_xyk::Error::<hydradx_runtime::Runtime>::MaxInRatioExceeded
+			);
+		});
+	}
+
+	#[test]
+	fn buy_should_work_when_route_contains_single_trade() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+			assert_balance!(BOB.into(), DOT, 0);
+
+			let amount_to_buy = 10 * UNITS;
+			let limit = 30 * UNITS;
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 25075000000001;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DOT, amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DOT,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn buy_should_work_when_route_contains_two_trades() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+			create_xyk_pool(DOT, DAI);
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+			assert_balance!(BOB.into(), DOT, 0);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE);
+
+			let amount_to_buy = UNITS;
+			let limit = 10 * UNITS;
+			let trades = vec![
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: HDX,
+					asset_out: DOT,
+				},
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: DOT,
+					asset_out: DAI,
+				},
+			];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 4_281_435_927_986;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DOT, 0);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn buy_should_work_when_route_contains_multiple_trades() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+			create_xyk_pool(DOT, LRNA);
+			create_xyk_pool(LRNA, DAI);
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+			assert_balance!(BOB.into(), DOT, 0);
+			assert_balance!(BOB.into(), LRNA, BOB_INITIAL_LRNA_BALANCE);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE);
+
+			let amount_to_buy = UNITS;
+			let limit = 10 * UNITS;
+			let trades = vec![
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: HDX,
+					asset_out: DOT,
+				},
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: DOT,
+					asset_out: LRNA,
+				},
+				Trade {
+					pool: PoolType::XYK,
+					asset_in: LRNA,
+					asset_out: DAI,
+				},
+			];
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_buy,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			let amount_in = 9_392_858_946_762;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DOT, 0);
+			assert_balance!(BOB.into(), LRNA, BOB_INITIAL_LRNA_BALANCE);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn buy_should_fail_when_there_is_no_pool_for_specific_asset_pair() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE);
+
+			let amount_to_sell = 10;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act and Assert
+			assert_noop!(
+				Router::buy(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					DAI,
+					amount_to_sell * UNITS,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_xyk::Error::<hydradx_runtime::Runtime>::TokenPoolNotFound
+			);
+		});
+	}
+
+	#[test]
+	fn buy_should_fail_when_balance_is_not_sufficient() {
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(DOT, HDX);
+
+			assert_balance!(BOB.into(), DOT, 0);
+			let amount_to_buy = 10 * UNITS;
+
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: DOT,
+				asset_out: HDX,
+			}];
+
+			//Act and Assert
+			assert_noop!(
+				Router::buy(
+					RuntimeOrigin::signed(BOB.into()),
+					DOT,
+					HDX,
+					amount_to_buy,
+					150 * UNITS,
+					trades.try_into().unwrap()
+				),
+				orml_tokens::Error::<hydradx_runtime::Runtime>::BalanceTooLow
+			);
+		});
+	}
+
+	#[test]
+	fn buy_should_fail_when_trading_limit_is_below_minimum() {
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+
+			let amount_to_buy = hydradx_runtime::MinTradingLimit::get() - 1;
+			let limit = 100 * UNITS;
+
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act and Assert
+			assert_noop!(
+				Router::buy(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					DOT,
+					amount_to_buy,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_xyk::Error::<hydradx_runtime::Runtime>::InsufficientTradingAmount
+			);
+		});
+	}
+
+	#[test]
+	fn buy_should_fail_when_buying_more_than_max_ratio_out() {
+		Hydra::execute_with(|| {
+			//Arrange
+			create_xyk_pool(HDX, DOT);
+
+			let amount_to_buy = 20 * UNITS;
+			let limit = 100 * UNITS;
+
+			let trades = vec![Trade {
+				pool: PoolType::XYK,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act and Assert
+			assert_noop!(
+				Router::buy(
+					RuntimeOrigin::signed(BOB.into()),
+					HDX,
+					DOT,
+					amount_to_buy,
+					limit,
+					trades.try_into().unwrap()
+				),
+				pallet_xyk::Error::<hydradx_runtime::Runtime>::MaxOutRatioExceeded
+			);
+		});
+	}
+}
+
+mod omnipool_stableswap_router_tests {
+	use super::*;
+
+	#[test]
+	fn sell_single_router_should_add_liquidity_to_stableswap_when_asset_out_is_share() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				let trades = vec![Trade {
+					pool: PoolType::Stableswap(pool_id),
+					asset_in: stable_asset_1,
+					asset_out: pool_id,
+				}];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+
+				//Act
+				let amount_to_sell = 100 * UNITS;
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					stable_asset_1,
+					pool_id,
+					amount_to_sell,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(stable_asset_1, &AccountId::from(ALICE)),
+					3000 * UNITS - amount_to_sell
+				);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn single_buy_router_should_work_one_stable_trade_when_asset_out_is_share_asset() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				let trades = vec![Trade {
+					pool: PoolType::Stableswap(pool_id),
+					asset_in: stable_asset_1,
+					asset_out: pool_id,
+				}];
+
+				assert_balance!(ALICE.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE);
+
+				//Act
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					stable_asset_1,
+					3000 * UNITS as i128,
+				));
+
+				let amount_to_buy = 100 * UNITS;
+
+				assert_ok!(Router::buy(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					stable_asset_1,
+					pool_id,
+					amount_to_buy,
+					u128::MAX,
+					trades.try_into().unwrap()
+				));
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn single_buy_router_should_work_one_stable_trade_when_asset_in_is_share() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				let trades = vec![Trade {
+					pool: PoolType::Stableswap(pool_id),
+					asset_in: pool_id,
+					asset_out: stable_asset_1,
+				}];
+
+				//Act
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					ALICE.into(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				let amount_to_buy = 100 * UNITS;
+
+				assert_ok!(Router::buy(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					pool_id,
+					stable_asset_1,
+					amount_to_buy,
+					u128::MAX,
+					trades.try_into().unwrap()
+				));
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+}
+
+mod set_route {
+	use super::*;
+	use frame_support::assert_noop;
+	use frame_support::storage::with_transaction;
+	use hydradx_traits::router::inverse_route;
+	use hydradx_traits::router::PoolType;
+	use sp_runtime::TransactionOutcome;
+
+	mod when_prestored_route_is_invalid {
+		use super::*;
+		use frame_support::assert_ok;
+		use hydradx_runtime::EmaOracle;
+		use hydradx_traits::AssetKind;
+		use primitives::constants::chain::XYK_SOURCE;
+		use sp_runtime::BoundedVec;
+
+		#[test]
+		fn set_route_should_work_with_omnipool_xyk_and_stable_pools() {
+			{
+				TestNet::reset();
+
+				Hydra::execute_with(|| {
+					let _ = with_transaction(|| {
+						//Arrange
+						let (pool_id, stable_asset_1, _) =
+							init_stableswap_with_details(1_000_000_000_000_000u128, 300_000_000_000_000u128, 18)
+								.unwrap();
+
+						// High stableswap fee keeps route1 (which hops through the pool) more
+						// expensive than the direct XYK route in both directions
+						assert_ok!(hydradx_runtime::Stableswap::update_pool_fee(
+							hydradx_runtime::RuntimeOrigin::root(),
+							pool_id,
+							Permill::from_percent(50),
+						));
+
+						init_omnipool();
+
+						assert_ok!(Currencies::transfer(
+							hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+							Omnipool::protocol_account(),
+							pool_id,
+							1000 * UNITS
+						));
+
+						assert_ok!(hydradx_runtime::Omnipool::add_token(
+							hydradx_runtime::RuntimeOrigin::root(),
+							pool_id,
+							FixedU128::from_rational(1, 2),
+							Permill::from_percent(1),
+							AccountId::from(BOB),
+						));
+
+						create_xyk_pool_with_amounts(DOT, 1000 * UNITS, stable_asset_1, 2000 * UNITS);
+						create_xyk_pool_with_amounts(HDX, 10000000 * UNITS, DOT, 10000 * UNITS);
+
+						let route1 = vec![
+							Trade {
+								pool: PoolType::Omnipool,
+								asset_in: HDX,
+								asset_out: pool_id,
+							},
+							Trade {
+								pool: PoolType::Stableswap(pool_id),
+								asset_in: pool_id,
+								asset_out: stable_asset_1,
+							},
+							Trade {
+								pool: PoolType::XYK,
+								asset_in: stable_asset_1,
+								asset_out: DOT,
+							},
+						];
+
+						let route2_cheaper = vec![Trade {
+							pool: PoolType::XYK,
+							asset_in: HDX,
+							asset_out: DOT,
+						}];
+
+						let asset_pair = Pair::new(HDX, DOT);
+
+						//Verify if the cheaper route is indeed cheaper in both ways
+						let amount_to_sell = UNITS;
+
+						//Check for normal route
+						let dot_amount_out = with_transaction::<_, _, _>(|| {
+							assert_ok!(Router::sell(
+								hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+								HDX,
+								DOT,
+								amount_to_sell,
+								0,
+								BoundedVec::truncate_from(route1.clone())
+							));
+							let alice_received_dot =
+								Currencies::free_balance(DOT, &AccountId::from(ALICE)) - ALICE_INITIAL_DOT_BALANCE;
+
+							TransactionOutcome::Rollback(Ok::<u128, DispatchError>(alice_received_dot))
+						})
+						.unwrap();
+
+						//Check for normal route
+						let dot_amout_out_for_cheaper_route = with_transaction::<_, _, _>(|| {
+							assert_ok!(Router::sell(
+								hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+								HDX,
+								DOT,
+								amount_to_sell,
+								0,
+								BoundedVec::truncate_from(route2_cheaper.clone())
+							));
+							let alice_received_dot =
+								Currencies::free_balance(DOT, &AccountId::from(ALICE)) - ALICE_INITIAL_DOT_BALANCE;
+
+							TransactionOutcome::Rollback(Ok::<u128, DispatchError>(alice_received_dot))
+						})
+						.unwrap();
+
+						assert!(dot_amout_out_for_cheaper_route > dot_amount_out);
+
+						// Check for inverse route
+						let amount_out_for_inverse = with_transaction::<_, _, _>(|| {
+							let alice_hdx_balance = Currencies::free_balance(HDX, &AccountId::from(ALICE));
+							assert_ok!(Router::sell(
+								hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+								DOT,
+								HDX,
+								amount_to_sell,
+								0,
+								inverse_route(route1.clone().try_into().unwrap())
+							));
+							let alice_received_hdx =
+								Currencies::free_balance(HDX, &AccountId::from(ALICE)) - alice_hdx_balance;
+
+							TransactionOutcome::Rollback(Ok::<u128, DispatchError>(alice_received_hdx))
+						})
+						.unwrap();
+
+						let amount_out_for_inverse_with_chaper_route = with_transaction::<_, _, _>(|| {
+							let alice_hdx_balance = Currencies::free_balance(HDX, &AccountId::from(ALICE));
+							assert_ok!(Router::sell(
+								hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+								DOT,
+								HDX,
+								amount_to_sell,
+								0,
+								inverse_route(route2_cheaper.clone().try_into().unwrap())
+							));
+							let alice_received_hdx =
+								Currencies::free_balance(HDX, &AccountId::from(ALICE)) - alice_hdx_balance;
+
+							TransactionOutcome::Rollback(Ok::<u128, DispatchError>(alice_received_hdx))
+						})
+						.unwrap();
+
+						assert!(amount_out_for_inverse_with_chaper_route > amount_out_for_inverse);
+
+						//ACT AND ASSERT
+						populate_oracle(HDX, DOT, route1.clone(), Some(10), None);
+
+						//We set first the more expensive route
+						assert_ok!(Router::set_route(
+							hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+							asset_pair,
+							route1.clone().try_into().unwrap()
+						));
+						assert_eq!(Router::route(asset_pair).unwrap(), route1);
+
+						//We set the cheaper one so it should replace existing one
+						populate_oracle(HDX, DOT, route2_cheaper.clone(), Some(11), None);
+						assert_ok!(Router::set_route(
+							hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+							asset_pair,
+							route2_cheaper.clone().try_into().unwrap()
+						));
+						assert_eq!(Router::route(asset_pair).unwrap(), route2_cheaper);
+
+						//We try to set back the more expensive but did not replace
+						assert_noop!(
+							Router::set_route(
+								hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+								asset_pair,
+								route1.try_into().unwrap()
+							),
+							pallet_route_executor::Error::<hydradx_runtime::Runtime>::RouteUpdateIsNotSuccessful
+						);
+						assert_eq!(Router::route(asset_pair).unwrap(), route2_cheaper);
+						TransactionOutcome::Commit(DispatchResult::Ok(()))
+					});
+				});
+			}
+		}
+
+		#[test]
+		fn set_route_should_fail_with_invalid_route() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					DOT,
+					3000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DOT,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(ETH, 1000 * UNITS, BTC, 1000 * UNITS);
+
+				let route1 = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: DOT,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: ETH,
+						asset_out: BTC,
+					},
+				];
+
+				let asset_pair = Pair::new(HDX, BTC);
+
+				//Act and assert
+				assert_noop!(
+					Router::set_route(
+						hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+						asset_pair,
+						route1.try_into().unwrap()
+					),
+					pallet_route_executor::Error::<hydradx_runtime::Runtime>::InvalidRoute
+				);
+			});
+		}
+
+		#[test]
+		fn set_route_should_work_when_stored_route_is_broken_due_to_not_existing_route() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					DOT,
+					1000000000000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DOT,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(DOT, 50000 * UNITS, BTC, 4000000 * UNITS);
+
+				let asset_pair = Pair::new(HDX, BTC);
+
+				let route = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: DOT,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: DOT,
+						asset_out: BTC,
+					},
+				];
+
+				populate_oracle(HDX, BTC, route.clone(), None, None);
+
+				//Act and assert
+				assert_ok!(Router::set_route(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					asset_pair,
+					route.try_into().unwrap()
+				),);
+			});
+		}
+
+		#[test]
+		fn invalid_new_normal_route_should_be_revalidated_with_lowest_liquidity_of_assets() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					DOT,
+					10000000000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DOT,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(DOT, 10 * UNITS, BTC, 1000000 * UNITS);
+
+				let asset_pair = Pair::new(DAI, BTC);
+
+				let route = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: DAI,
+						asset_out: DOT,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: DOT,
+						asset_out: BTC,
+					},
+				];
+
+				//To prevent ED error
+				assert_ok!(hydradx_runtime::Tokens::set_balance(
+					RawOrigin::Root.into(),
+					DAVE.into(),
+					BTC,
+					UNITS,
+					0,
+				));
+
+				populate_oracle(DAI, BTC, route.clone(), None, Some(90 * UNITS));
+
+				//Act and assert
+				assert_ok!(Router::set_route(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					asset_pair,
+					route.try_into().unwrap()
+				),);
+			});
+		}
+
+		#[test]
+		fn invalid_new_inverse_route_should_be_revalidated_with_lowest_liquidity_of_assets() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					DOT,
+					1000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DOT,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(DOT, 100000000000 * UNITS, BTC, 100000000000 * UNITS);
+
+				let asset_pair = Pair::new(HDX, BTC);
+
+				let route = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: DOT,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: DOT,
+						asset_out: BTC,
+					},
+				];
+
+				populate_oracle(HDX, BTC, route.clone(), None, None);
+
+				//Act and assert
+				assert_ok!(Router::set_route(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					asset_pair,
+					route.try_into().unwrap()
+				),);
+			});
+		}
+
+		#[test]
+		fn set_should_work_when_omnipool_route_does_not_exist_for_pair() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				create_xyk_pool_with_amounts(HDX, 1000000 * UNITS, DOT, 1000000 * UNITS);
+				create_xyk_pool_with_amounts(DOT, 1000000 * UNITS, BTC, 1000000 * UNITS);
+
+				let route1 = vec![
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: HDX,
+						asset_out: DOT,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: DOT,
+						asset_out: BTC,
+					},
+				];
+
+				populate_oracle(HDX, BTC, route1.clone(), None, None);
+
+				let asset_pair = Pair::new(HDX, BTC);
+
+				assert_ok!(Router::set_route(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					asset_pair,
+					route1.try_into().unwrap()
+				));
+			});
+		}
+
+		#[test]
+		fn set_route_should_not_work_when_route_has_insufficient_asset_without_oracle() {
+			{
+				TestNet::reset();
+
+				Hydra::execute_with(|| {
+					let _ = with_transaction(|| {
+						let name = b"INSUF1".to_vec();
+						let insufficient_asset = AssetRegistry::register_insufficient_asset(
+							None,
+							Some(name.try_into().unwrap()),
+							AssetKind::External,
+							Some(1_000),
+							None,
+							None,
+							None,
+							None,
+						)
+						.unwrap();
+
+						let route1 = vec![Trade {
+							pool: PoolType::XYK,
+							asset_in: DOT,
+							asset_out: insufficient_asset,
+						}];
+
+						create_xyk_pool_with_amounts(DOT, 10000 * UNITS, insufficient_asset, 10000 * UNITS);
+
+						//Act
+						assert_noop!(
+							Router::set_route(
+								hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+								Pair::new(DOT, insufficient_asset),
+								route1.clone().try_into().unwrap()
+							),
+							pallet_route_executor::Error::<hydradx_runtime::Runtime>::RouteHasNoOracle
+						);
+
+						TransactionOutcome::Commit(DispatchResult::Ok(()))
+					});
+				});
+			}
+		}
+
+		#[test]
+		fn set_route_should_work_when_route_has_insufficient_asset_with_oracle() {
+			{
+				TestNet::reset();
+
+				Hydra::execute_with(|| {
+					let _ = with_transaction(|| {
+						let name = b"INSUF1".to_vec();
+						let insufficient_asset = AssetRegistry::register_insufficient_asset(
+							None,
+							Some(name.try_into().unwrap()),
+							AssetKind::External,
+							Some(1_000),
+							None,
+							None,
+							None,
+							None,
+						)
+						.unwrap();
+
+						let route1 = vec![Trade {
+							pool: PoolType::XYK,
+							asset_in: DOT,
+							asset_out: insufficient_asset,
+						}];
+
+						create_xyk_pool_with_amounts(DOT, 10000 * UNITS, insufficient_asset, 10000 * UNITS);
+
+						//Whitelist insufficient asset in oracle
+						EmaOracle::add_oracle(
+							hydradx_runtime::RuntimeOrigin::root(),
+							XYK_SOURCE,
+							(DOT, insufficient_asset),
+						)
+						.unwrap();
+
+						populate_oracle(DOT, insufficient_asset, route1.clone(), None, Some(10 * UNITS));
+
+						//Act
+						assert_ok!(Router::set_route(
+							hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+							Pair::new(DOT, insufficient_asset),
+							route1.clone().try_into().unwrap()
+						),);
+
+						TransactionOutcome::Commit(DispatchResult::Ok(()))
+					});
+				});
+			}
+		}
+	}
+
+	mod when_prestored_route_is_valid {
+		use super::*;
+
+		#[test]
+		fn set_route_should_fail_with_trying_to_override_with_invalid_route() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					DOT,
+					3000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DOT,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(DOT, 1000 * UNITS, BTC, 1000 * UNITS);
+
+				let route1 = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: DOT,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: DOT,
+						asset_out: BTC,
+					},
+				];
+
+				populate_oracle(HDX, BTC, route1.clone(), None, None);
+
+				let asset_pair = Pair::new(HDX, BTC);
+
+				//Act and assert
+				assert_ok!(Router::set_route(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					asset_pair,
+					route1.try_into().unwrap()
+				));
+
+				create_xyk_pool_with_amounts(ETH, 1000 * UNITS, BTC, 1000 * UNITS);
+
+				let invalid_route = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: DOT,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: ETH,
+						asset_out: BTC,
+					},
+				];
+				assert_noop!(
+					Router::set_route(
+						hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+						asset_pair,
+						invalid_route.try_into().unwrap()
+					),
+					pallet_route_executor::Error::<hydradx_runtime::Runtime>::InvalidRoute
+				);
+			});
+		}
+
+		#[test]
+		fn invalid_new_normal_route_should_be_revalidated_with_other_asset_liquidity() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					BTC,
+					1000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					BTC,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					ETH,
+					1000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ETH,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(BTC, 1000 * UNITS, DAI, 1000 * UNITS);
+				create_xyk_pool_with_amounts(DAI, 1000 * UNITS, ETH, 1000 * UNITS);
+
+				let asset_pair = Pair::new(BTC, ETH);
+
+				let route = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: BTC,
+						asset_out: DAI,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: DAI,
+						asset_out: ETH,
+					},
+				];
+
+				populate_oracle(BTC, ETH, route.clone(), None, Some(UNITS / 1000000));
+
+				//Validation is fine so no AMM error, but since the route is not better, it results in unsuccessfull route setting
+				assert_noop!(
+					Router::set_route(
+						hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+						asset_pair,
+						route.try_into().unwrap()
+					),
+					pallet_route_executor::Error::<hydradx_runtime::Runtime>::RouteUpdateIsNotSuccessful
+				);
+			});
+		}
+
+		#[test]
+		fn invalid_new_inversed_route_should_be_revalidated_with_other_asset_liquidity() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					BTC,
+					1000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					BTC,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					ETH,
+					1000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ETH,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(BTC, 1000 * UNITS, DAI, 1000 * UNITS);
+				create_xyk_pool_with_amounts(DAI, 10000000 * UNITS, ETH, 10000000 * UNITS);
+
+				let asset_pair = Pair::new(BTC, ETH);
+
+				let route = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: BTC,
+						asset_out: DAI,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: DAI,
+						asset_out: ETH,
+					},
+				];
+
+				populate_oracle(BTC, ETH, route.clone(), None, Some(UNITS / 100));
+
+				//Validation is fine, but since the route is not better, it results in unsuccessfull route setting
+				assert_noop!(
+					Router::set_route(
+						hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+						asset_pair,
+						route.try_into().unwrap()
+					),
+					pallet_route_executor::Error::<hydradx_runtime::Runtime>::RouteUpdateIsNotSuccessful
+				);
+			});
+		}
+
+		#[test]
+		fn set_route_should_not_work_when_setting_default_omni_route_again() {
+			TestNet::reset();
+
+			Hydra::execute_with(|| {
+				//Arrange
+				init_omnipool();
+
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					Omnipool::protocol_account(),
+					DOT,
+					1000 * UNITS as i128,
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					DOT,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let route1 = vec![Trade {
+					pool: PoolType::Omnipool,
+					asset_in: HDX,
+					asset_out: DOT,
+				}];
+
+				populate_oracle(HDX, DOT, route1.clone(), None, None);
+
+				let asset_pair = Pair::new(HDX, DOT);
+
+				assert_noop!(
+					Router::set_route(
+						hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+						asset_pair,
+						route1.try_into().unwrap()
+					),
+					pallet_route_executor::Error::<hydradx_runtime::Runtime>::RouteUpdateIsNotSuccessful
+				);
+			});
+		}
+	}
+}
+
+mod with_on_chain_and_default_route {
+	use super::*;
+	use frame_support::assert_ok;
+	use sp_runtime::BoundedVec;
+
+	#[test]
+	fn buy_should_work_with_onchain_route() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(DOT, 1000 * UNITS, stable_asset_1, 1000 * UNITS);
+
+				let route1 = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: pool_id,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: stable_asset_1,
+						asset_out: DOT,
+					},
+				];
+
+				populate_oracle(HDX, DOT, route1.clone(), None, None);
+
+				let asset_pair = Pair::new(HDX, DOT);
+				let amount_to_buy = 100 * UNITS;
+
+				assert_ok!(Router::set_route(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					asset_pair,
+					route1.clone().try_into().unwrap()
+				));
+				assert_eq!(Router::route(asset_pair).unwrap(), route1);
+
+				//Act
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					HDX,
+					100000 * UNITS as i128,
+				));
+
+				assert_balance!(ALICE.into(), DOT, ALICE_INITIAL_DOT_BALANCE);
+				assert_ok!(Router::buy(
+					RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					DOT,
+					amount_to_buy,
+					u128::MAX,
+					BoundedVec::new(),
+				));
+
+				assert_balance!(ALICE.into(), DOT, ALICE_INITIAL_DOT_BALANCE + amount_to_buy);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_work_with_onchain_route() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(DOT, 1000 * UNITS, stable_asset_1, 1000 * UNITS);
+
+				let route1 = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: pool_id,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: stable_asset_1,
+						asset_out: DOT,
+					},
+				];
+
+				populate_oracle(HDX, DOT, route1.clone(), None, None);
+
+				let asset_pair = Pair::new(HDX, DOT);
+				let amount_to_sell = 100 * UNITS;
+
+				assert_ok!(Router::set_route(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					asset_pair,
+					route1.clone().try_into().unwrap()
+				));
+				assert_eq!(Router::route(asset_pair).unwrap(), route1);
+
+				//Act
+				assert_balance!(ALICE.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE);
+				assert_ok!(Router::sell(
+					RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					DOT,
+					amount_to_sell,
+					0,
+					BoundedVec::new(),
+				));
+
+				assert_balance!(ALICE.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE - amount_to_sell);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_work_with_onchain_route_but_used_in_reversed_order() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_rational(1, 2),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				create_xyk_pool_with_amounts(DOT, 1000 * UNITS, stable_asset_1, 1000 * UNITS);
+
+				let route1 = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: pool_id,
+						asset_out: stable_asset_1,
+					},
+					Trade {
+						pool: PoolType::XYK,
+						asset_in: stable_asset_1,
+						asset_out: DOT,
+					},
+				];
+
+				populate_oracle(HDX, DOT, route1.clone(), None, None);
+
+				let asset_pair = Pair::new(HDX, DOT);
+				let amount_to_sell = 100 * UNITS;
+
+				assert_ok!(Router::set_route(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					asset_pair,
+					route1.clone().try_into().unwrap()
+				));
+				assert_eq!(Router::route(asset_pair).unwrap(), route1);
+
+				//Act
+				assert_balance!(ALICE.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE);
+				assert_ok!(Router::sell(
+					RuntimeOrigin::signed(ALICE.into()),
+					DOT,
+					HDX,
+					amount_to_sell,
+					0,
+					BoundedVec::new(),
+				));
+
+				assert_balance!(ALICE.into(), DOT, ALICE_INITIAL_DOT_BALANCE - amount_to_sell);
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn sell_should_work_with_default_omnipool_when_no_onchain_or_specified_route_present() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let amount_to_sell = 10 * UNITS;
+			let limit = 0;
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_sell,
+				limit,
+				BoundedVec::new()
+			));
+
+			//Assert
+			let amount_out = 266195070030573798;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_out);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in: amount_to_sell,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn buy_should_work_default_omni_route_when_no_onchain_or_specified_route_present() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			init_omnipool();
+
+			let amount_to_buy = UNITS * 100000;
+			let limit = 100 * UNITS;
+
+			//Act
+			assert_ok!(Router::buy(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				amount_to_buy,
+				limit,
+				BoundedVec::new()
+			));
+
+			//Assert
+			let amount_in = 3756606010477;
+
+			assert_balance!(BOB.into(), HDX, BOB_INITIAL_NATIVE_BALANCE - amount_in);
+			assert_balance!(BOB.into(), DAI, BOB_INITIAL_DAI_BALANCE + amount_to_buy);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in,
+				amount_out: amount_to_buy,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+}
+
+mod route_spot_price {
+	use super::*;
+	use hydradx_traits::router::PoolType;
+	use sp_runtime::FixedU128;
+
+	//TODO: Make LBP work with Router: https://github.com/galacticcouncil/hydration-node/issues/1059
+	#[ignore]
+	#[test]
+	fn spot_price_should_be_ok_for_lbp() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			//Arrange
+			create_lbp_pool(HDX, DOT);
+
+			go_to_block(LBP_SALE_START + 7);
+
+			let amount_to_sell = UNITS;
+			let limit = 0;
+			let trades = vec![Trade {
+				pool: PoolType::LBP,
+				asset_in: HDX,
+				asset_out: DOT,
+			}];
+
+			//Act
+			assert_ok!(Router::sell(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DOT,
+				amount_to_sell,
+				limit,
+				BoundedVec::truncate_from(trades.clone())
+			));
+
+			//Assert
+			let amount_out = 1_022562572986; //+7 blocks
+
+			assert_balance!(BOB.into(), HDX, ALICE_INITIAL_NATIVE_BALANCE - amount_to_sell);
+			assert_balance!(BOB.into(), DOT, amount_out);
+
+			let spot_price_of_hdx_per_dot = Router::spot_price_with_fee(&trades).unwrap();
+			let calculated_amount_out = spot_price_of_hdx_per_dot
+				.reciprocal()
+				.unwrap()
+				.checked_mul_int(amount_to_sell)
+				.unwrap();
+			let difference = amount_out - calculated_amount_out;
+			let relative_difference = FixedU128::from_rational(difference, amount_out);
+			let tolerated_difference = FixedU128::from_rational(1, 100);
+			// The difference of the amount out calculated with spot price should be less than 1%
+			assert!(relative_difference < tolerated_difference);
+			//assert_eq!(relative_difference, FixedU128::from_float(0.009468191066027364)); //TEMP assertion
+		});
+	}
+
+	#[test]
+	fn route_should_have_spot_price_when_stable_share_asset_included() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) =
+					init_stableswap_with_details(1_000_000_000_000_000_000u128, 300_000_000_000_000_000u128, 12)
+						.unwrap();
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					Omnipool::protocol_account(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				assert_ok!(hydradx_runtime::Omnipool::add_token(
+					hydradx_runtime::RuntimeOrigin::root(),
+					pool_id,
+					FixedU128::from_inner(25_650_000_000_000_000),
+					Permill::from_percent(1),
+					AccountId::from(BOB),
+				));
+
+				let trades = vec![
+					Trade {
+						pool: PoolType::Omnipool,
+						asset_in: HDX,
+						asset_out: pool_id,
+					},
+					Trade {
+						pool: PoolType::Stableswap(pool_id),
+						asset_in: pool_id,
+						asset_out: stable_asset_1,
+					},
+				];
+				let amount_to_sell = UNITS;
+
+				//Act
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					HDX,
+					stable_asset_1,
+					amount_to_sell,
+					0,
+					BoundedVec::truncate_from(trades.clone())
+				));
+
+				//Assert
+				let expected_amount_out = 46467;
+
+				assert_eq!(
+					hydradx_runtime::Balances::free_balance(AccountId::from(ALICE)),
+					ALICE_INITIAL_NATIVE_BALANCE - amount_to_sell
+				);
+
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(stable_asset_1, &AccountId::from(ALICE)),
+					expected_amount_out
+				);
+
+				let spot_price_of_hdx_per_dot = Router::spot_price_with_fee(&trades).unwrap();
+				let calculated_amount_out = spot_price_of_hdx_per_dot
+					.reciprocal()
+					.unwrap()
+					.checked_mul_int(amount_to_sell)
+					.unwrap();
+				let difference = expected_amount_out.abs_diff(calculated_amount_out);
+				let relative_difference = FixedU128::from_rational(difference, expected_amount_out);
+				let tolerated_difference = FixedU128::from_rational(1, 100);
+				// The difference of the amount out calculated with spot price should be less than 1%
+				//assert_eq!(relative_difference, FixedU128::from_float(0.002991370219725827)); //TEMP assertion
+				assert!(relative_difference < tolerated_difference);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+
+	#[test]
+	fn route_should_have_spot_price_when_only_stable_share_asset_included() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) =
+					init_stableswap_with_details(1_000_000_000_000_000_000u128, 300_000_000_000_000_000u128, 12)
+						.unwrap();
+				init_omnipool();
+
+				assert_ok!(Currencies::transfer(
+					hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+					ALICE.into(),
+					pool_id,
+					3000 * UNITS
+				));
+
+				let trades = vec![Trade {
+					pool: PoolType::Stableswap(pool_id),
+					asset_in: pool_id,
+					asset_out: stable_asset_1,
+				}];
+				let amount_to_sell = UNITS;
+
+				//Act
+				assert_ok!(Router::sell(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					pool_id,
+					stable_asset_1,
+					amount_to_sell,
+					0,
+					BoundedVec::truncate_from(trades.clone())
+				));
+
+				//Assert
+				let expected_amount_out = 994999;
+
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(pool_id, &AccountId::from(ALICE)),
+					3000 * UNITS - amount_to_sell
+				);
+
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(stable_asset_1, &AccountId::from(ALICE)),
+					expected_amount_out
+				);
+
+				let spot_price_of_hdx_per_dot = Router::spot_price_with_fee(&trades).unwrap();
+				let calculated_amount_out = spot_price_of_hdx_per_dot
+					.reciprocal()
+					.unwrap()
+					.checked_mul_int(amount_to_sell)
+					.unwrap();
+				let difference = expected_amount_out.abs_diff(calculated_amount_out);
+				let relative_difference = FixedU128::from_rational(difference, expected_amount_out);
+				let tolerated_difference = FixedU128::from_rational(1, 100);
+				// The difference of the amount out calculated with spot price should be less than 1%
+				//assert_eq!(relative_difference, FixedU128::from_float(0.003019098511656796)); //TEMP assertion
+				assert!(relative_difference < tolerated_difference);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+}
+
+mod sell_all {
+	use super::*;
+	use hydradx_runtime::Currencies;
+	use hydradx_traits::router::PoolType;
+
+	#[test]
+	fn sell_should_sell_all_user_native_balance() {
+		TestNet::reset();
+
+		let limit = 0;
+		let amount_out = 26577363534770086553;
+
+		Hydra::execute_with(|| {
+			let bob_hdx_balance = Currencies::free_balance(HDX, &BOB.into());
+
+			//Arrange
+			init_omnipool();
+
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: DAI,
+			}];
+
+			//Act
+			assert_ok!(Router::sell_all(
+				RuntimeOrigin::signed(BOB.into()),
+				HDX,
+				DAI,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			assert_balance!(BOB.into(), HDX, 0);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: HDX,
+				asset_out: DAI,
+				amount_in: bob_hdx_balance,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn sell_all_should_sell_all_user_nonnative_balance() {
+		TestNet::reset();
+
+		let limit = 0;
+		let amount_out = 35227901268414708;
+
+		Hydra::execute_with(|| {
+			let bob_nonnative_balance = Currencies::free_balance(DAI, &BOB.into());
+
+			//Arrange
+			init_omnipool();
+
+			let trades = vec![Trade {
+				pool: PoolType::Omnipool,
+				asset_in: DAI,
+				asset_out: HDX,
+			}];
+
+			//Act
+			assert_ok!(Router::sell_all(
+				RuntimeOrigin::signed(BOB.into()),
+				DAI,
+				HDX,
+				limit,
+				trades.try_into().unwrap()
+			));
+
+			//Assert
+			assert_balance!(BOB.into(), DAI, 0);
+
+			expect_hydra_last_events(vec![pallet_route_executor::Event::Executed {
+				asset_in: DAI,
+				asset_out: HDX,
+				amount_in: bob_nonnative_balance,
+				amount_out,
+				event_id: 0,
+			}
+			.into()]);
+		});
+	}
+
+	#[test]
+	fn sell_all_should_work_when_selling_all_nonnative_in_stableswap() {
+		TestNet::reset();
+
+		Hydra::execute_with(|| {
+			let _ = with_transaction(|| {
+				//Arrange
+				let (pool_id, stable_asset_1, _) = init_stableswap().unwrap();
+
+				init_omnipool();
+
+				let init_balance = 3000 * UNITS + 1;
+				assert_ok!(Currencies::update_balance(
+					hydradx_runtime::RuntimeOrigin::root(),
+					ALICE.into(),
+					stable_asset_1,
+					init_balance as i128,
+				));
+
+				let trades = vec![Trade {
+					pool: PoolType::Stableswap(pool_id),
+					asset_in: stable_asset_1,
+					asset_out: pool_id,
+				}];
+
+				assert_balance!(ALICE.into(), pool_id, 0);
+
+				//Act
+				assert_ok!(Router::sell_all(
+					hydradx_runtime::RuntimeOrigin::signed(ALICE.into()),
+					stable_asset_1,
+					pool_id,
+					0,
+					trades.try_into().unwrap()
+				));
+
+				//Assert
+				assert_eq!(
+					hydradx_runtime::Currencies::free_balance(stable_asset_1, &AccountId::from(ALICE)),
+					0
+				);
+
+				TransactionOutcome::Commit(DispatchResult::Ok(()))
+			});
+		});
+	}
+}
+
+pub fn create_lbp_pool(accumulated_asset: u32, distributed_asset: u32) {
+	assert_ok!(Currencies::update_balance(
+		hydradx_runtime::RuntimeOrigin::root(),
+		DAVE.into(),
+		accumulated_asset,
+		1000 * UNITS as i128,
+	));
+	assert_ok!(Currencies::update_balance(
+		hydradx_runtime::RuntimeOrigin::root(),
+		DAVE.into(),
+		distributed_asset,
+		1000 * UNITS as i128,
+	));
+	assert_ok!(LBP::create_pool(
+		RuntimeOrigin::root(),
+		DAVE.into(),
+		accumulated_asset,
+		100 * UNITS,
+		distributed_asset,
+		200 * UNITS,
+		20_000_000,
+		80_000_000,
+		WeightCurveType::Linear,
+		(2, 1_000),
+		CHARLIE.into(),
+		0,
+	));
+
+	let account_id = get_lbp_pair_account_id(accumulated_asset, distributed_asset);
+
+	assert_ok!(LBP::update_pool_data(
+		RuntimeOrigin::signed(DAVE.into()),
+		account_id,
+		None,
+		Some(LBP_SALE_START),
+		Some(LBP_SALE_END),
+		None,
+		None,
+		None,
+		None,
+		None,
+	));
+}
+
+fn get_lbp_pair_account_id(asset_a: AssetId, asset_b: AssetId) -> AccountId {
+	let asset_pair = pallet_lbp::AssetPair {
+		asset_in: asset_a,
+		asset_out: asset_b,
+	};
+	LBP::get_pair_id(asset_pair)
+}
+
+fn start_lbp_campaign() {
+	go_to_block(LBP_SALE_START + 1);
+}
+
+pub fn create_xyk_pool(asset_a: u32, asset_b: u32) {
+	assert_ok!(XYK::create_pool(
+		RuntimeOrigin::signed(ALICE.into()),
+		asset_a,
+		100 * UNITS,
+		asset_b,
+		50 * UNITS,
+	));
+}
+
+fn create_xyk_pool_with_amounts(asset_a: u32, amount_a: u128, asset_b: u32, amount_b: u128) {
+	assert_ok!(Currencies::update_balance(
+		hydradx_runtime::RuntimeOrigin::root(),
+		DAVE.into(),
+		asset_a,
+		amount_a as i128,
+	));
+	assert_ok!(Currencies::update_balance(
+		hydradx_runtime::RuntimeOrigin::root(),
+		DAVE.into(),
+		asset_b,
+		amount_b as i128,
+	));
+
+	assert_ok!(XYK::create_pool(
+		RuntimeOrigin::signed(DAVE.into()),
+		asset_a,
+		amount_a,
+		asset_b,
+		amount_b,
+	));
+}
+
+pub fn init_stableswap() -> Result<(AssetId, AssetId, AssetId), DispatchError> {
+	let initial_liquidity = 1_000_000_000_000_000u128;
+	let liquidity_added = 300_000_000_000_000u128;
+
+	init_stableswap_with_details(initial_liquidity, liquidity_added, 18)
+}
+
+pub fn init_stableswap_with_details(
+	initial_liquidity: Balance,
+	liquidity_added: Balance,
+	decimals: u8,
+) -> Result<(AssetId, AssetId, AssetId), DispatchError> {
+	let mut initial: Vec<AssetAmount<<hydradx_runtime::Runtime as pallet_stableswap::Config>::AssetId>> = vec![];
+	let mut added_liquidity: Vec<AssetAmount<<hydradx_runtime::Runtime as pallet_stableswap::Config>::AssetId>> =
+		vec![];
+
+	let mut asset_ids: Vec<<hydradx_runtime::Runtime as pallet_stableswap::Config>::AssetId> = Vec::new();
+	for idx in 0u32..MAX_ASSETS_IN_POOL {
+		let name: Vec<u8> = idx.to_ne_bytes().to_vec();
+		let asset_id = AssetRegistry::register_sufficient_asset(
+			None,
+			Some(name.try_into().unwrap()),
+			AssetKind::Token,
+			1000u128,
+			Some(b"xDUM".to_vec().try_into().unwrap()),
+			Some(decimals),
+			None,
+			None,
+		)?;
+		asset_ids.push(asset_id);
+
+		Currencies::update_balance(
+			hydradx_runtime::RuntimeOrigin::root(),
+			AccountId::from(BOB),
+			asset_id,
+			initial_liquidity as i128,
+		)?;
+		Currencies::update_balance(
+			hydradx_runtime::RuntimeOrigin::root(),
+			AccountId::from(CHARLIE),
+			asset_id,
+			initial_liquidity as i128,
+		)?;
+
+		initial.push(AssetAmount::new(asset_id, initial_liquidity));
+		added_liquidity.push(AssetAmount::new(asset_id, liquidity_added));
+	}
+	let pool_id = AssetRegistry::register_sufficient_asset(
+		None,
+		Some(b"pool".to_vec().try_into().unwrap()),
+		AssetKind::Token,
+		1000u128,
+		None,
+		None,
+		None,
+		None,
+	)?;
+
+	let amplification = 100u16;
+	let fee = Permill::from_percent(1);
+
+	let asset_in: AssetId = *asset_ids.last().unwrap();
+	let asset_out: AssetId = *asset_ids.first().unwrap();
+
+	Stableswap::create_pool(
+		hydradx_runtime::RuntimeOrigin::root(),
+		pool_id,
+		BoundedVec::truncate_from(asset_ids),
+		amplification,
+		fee,
+	)?;
+
+	Stableswap::add_assets_liquidity(
+		hydradx_runtime::RuntimeOrigin::signed(BOB.into()),
+		pool_id,
+		BoundedVec::truncate_from(initial),
+		Balance::zero(),
+	)?;
+
+	Ok((pool_id, asset_in, asset_out))
+}
+
+fn populate_oracle(
+	asset_in: AssetId,
+	asset_out: AssetId,
+	route: Vec<Trade<u32>>,
+	block: Option<BlockNumber>,
+	amount: Option<u128>,
+) {
+	assert_ok!(hydradx_runtime::Tokens::set_balance(
+		RawOrigin::Root.into(),
+		DAVE.into(),
+		asset_in,
+		amount.unwrap_or(100 * UNITS),
+		0,
+	));
+	assert_ok!(Router::sell(
+		hydradx_runtime::RuntimeOrigin::signed(DAVE.into()),
+		asset_in,
+		asset_out,
+		amount.unwrap_or(UNITS),
+		0,
+		BoundedVec::truncate_from(route.clone())
+	));
+	go_to_block(block.unwrap_or(10));
+}
+
+mod weight_uses_resolved_route {
+	use super::*;
+	use frame_support::dispatch::GetDispatchInfo;
+
+	fn stored_multi_hop_route() -> Vec<Trade<AssetId>> {
+		vec![
+			Trade {
+				pool: PoolType::Omnipool,
+				asset_in: HDX,
+				asset_out: DAI,
+			},
+			Trade {
+				pool: PoolType::XYK,
+				asset_in: DAI,
+				asset_out: DOT,
+			},
+			Trade {
+				pool: PoolType::Omnipool,
+				asset_in: DOT,
+				asset_out: ETH,
+			},
+		]
+	}
+
+	#[test]
+	fn sell_weight_should_reflect_stored_route_when_input_route_is_empty() {
+		TestNet::reset();
+		Hydra::execute_with(|| {
+			let stored = stored_multi_hop_route();
+			assert_ok!(Router::force_insert_route(
+				RuntimeOrigin::root(),
+				Pair::new(HDX, ETH),
+				BoundedVec::truncate_from(stored.clone()),
+			));
+
+			let call = pallet_route_executor::Call::<Runtime>::sell {
+				asset_in: HDX,
+				asset_out: ETH,
+				amount_in: UNITS,
+				min_amount_out: 0,
+				route: BoundedVec::new(),
+			};
+
+			let charged = call.get_dispatch_info().call_weight;
+			let expected = RouterWeightInfo::sell_weight(&stored);
+			assert_eq!(charged, expected);
+		});
+	}
+
+	#[test]
+	fn buy_weight_should_reflect_stored_route_when_input_route_is_empty() {
+		TestNet::reset();
+		Hydra::execute_with(|| {
+			let stored = stored_multi_hop_route();
+			assert_ok!(Router::force_insert_route(
+				RuntimeOrigin::root(),
+				Pair::new(HDX, ETH),
+				BoundedVec::truncate_from(stored.clone()),
+			));
+
+			let call = pallet_route_executor::Call::<Runtime>::buy {
+				asset_in: HDX,
+				asset_out: ETH,
+				amount_out: UNITS,
+				max_amount_in: u128::MAX,
+				route: BoundedVec::new(),
+			};
+
+			let charged = call.get_dispatch_info().call_weight;
+			let expected = RouterWeightInfo::buy_weight(&stored);
+			assert_eq!(charged, expected);
+		});
+	}
+
+	#[test]
+	fn sell_all_weight_should_reflect_stored_route_when_input_route_is_empty() {
+		TestNet::reset();
+		Hydra::execute_with(|| {
+			let stored = stored_multi_hop_route();
+			assert_ok!(Router::force_insert_route(
+				RuntimeOrigin::root(),
+				Pair::new(HDX, ETH),
+				BoundedVec::truncate_from(stored.clone()),
+			));
+
+			let call = pallet_route_executor::Call::<Runtime>::sell_all {
+				asset_in: HDX,
+				asset_out: ETH,
+				min_amount_out: 0,
+				route: BoundedVec::new(),
+			};
+
+			let charged = call.get_dispatch_info().call_weight;
+			let expected = RouterWeightInfo::sell_weight(&stored);
+			assert_eq!(charged, expected);
+		});
+	}
+
+	#[test]
+	fn sell_weight_should_be_higher_with_stored_multi_hop_route_than_without() {
+		TestNet::reset();
+		Hydra::execute_with(|| {
+			let call_without_stored = pallet_route_executor::Call::<Runtime>::sell {
+				asset_in: HDX,
+				asset_out: ETH,
+				amount_in: UNITS,
+				min_amount_out: 0,
+				route: BoundedVec::new(),
+			};
+			let weight_without_stored = call_without_stored.get_dispatch_info().call_weight;
+
+			assert_ok!(Router::force_insert_route(
+				RuntimeOrigin::root(),
+				Pair::new(HDX, ETH),
+				BoundedVec::truncate_from(stored_multi_hop_route()),
+			));
+
+			let call_with_stored = pallet_route_executor::Call::<Runtime>::sell {
+				asset_in: HDX,
+				asset_out: ETH,
+				amount_in: UNITS,
+				min_amount_out: 0,
+				route: BoundedVec::new(),
+			};
+			let weight_with_stored = call_with_stored.get_dispatch_info().call_weight;
+
+			assert!(
+				weight_with_stored.ref_time() > weight_without_stored.ref_time(),
+				"expected stored-route call to charge more ref_time than no-stored-route call \
+				 (got {} vs {})",
+				weight_with_stored.ref_time(),
+				weight_without_stored.ref_time(),
+			);
+		});
+	}
+}

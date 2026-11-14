@@ -1,0 +1,84 @@
+[package]
+name = "pallet-omnipool"
+version = "7.4.3"
+authors = ['GalacticCouncil']
+edition = "2021"
+license = "Apache-2.0"
+homepage = 'https://github.com/galacticcouncil/hydradx-node'
+repository = 'https://github.com/galacticcouncil/hydradx-node'
+description = "HydraDX Omnipool pallet"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+# parity
+scale-info = { workspace = true }
+codec = { workspace = true }
+
+# HydraDX dependencies
+hydradx-traits = { workspace = true }
+hydra-dx-math = { workspace = true }
+pallet-broadcast = { workspace = true }
+
+# primitives
+sp-runtime = { workspace = true }
+sp-std = { workspace = true }
+
+# FRAME
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+
+# ORML
+orml-traits = { workspace = true }
+
+# third party
+primitive-types = { workspace = true }
+bitflags = { workspace = true }
+impl-trait-for-tuples = { workspace = true }
+log = { workspace = true }
+
+# Optional imports for benchmarking
+frame-benchmarking = { workspace = true, optional = true }
+pallet-balances = { workspace = true, optional = true }
+sp-core = { workspace = true, optional = true }
+sp-io = { workspace = true, optional = true }
+
+[dev-dependencies]
+sp-core = { workspace = true }
+sp-io = { workspace = true }
+sp-tracing = { workspace = true }
+pallet-balances = { workspace = true }
+frame-benchmarking = { workspace = true }
+orml-tokens = { workspace = true }
+proptest = { workspace = true }
+pretty_assertions = { workspace = true }
+test-utils = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "sp-runtime/std",
+    "sp-std/std",
+    "frame-support/std",
+    "frame-system/std",
+    "scale-info/std",
+    "sp-core/std",
+    "sp-io/std",
+    "pallet-balances/std",
+    "orml-tokens/std",
+    "frame-benchmarking/std",
+    "pallet-broadcast/std",
+    'hydradx-traits/std',
+    'hydra-dx-math/std',
+    'orml-traits/std',
+]
+runtime-benchmarks = [
+    "frame-benchmarking/runtime-benchmarks",
+    "sp-core",
+    "sp-io",
+    "pallet-balances",
+]
+try-runtime = ["frame-support/try-runtime"]

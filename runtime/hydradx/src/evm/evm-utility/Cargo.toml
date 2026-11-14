@@ -1,0 +1,34 @@
+[package]
+name = "module-evm-utility"
+version = "2.22.0"
+authors = ["Acala Developers"]
+edition = "2021"
+
+[dependencies]
+sha3 = { workspace = true }
+
+#Substrate dependencies
+sp-std = { workspace = true }
+
+#Evm dependencies
+evm = { workspace = true, features = ["with-codec"] }
+evm-gasometer = { workspace = true }
+evm-runtime = { workspace = true }
+ethereum = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "sha3/std",
+    "sp-std/std",
+    "evm/std",
+    "evm/with-serde",
+    "evm-runtime/std",
+    "evm-gasometer/std",
+    "ethereum/with-serde",
+]
+tracing = [
+    "evm/tracing",
+    "evm-gasometer/tracing",
+    "evm-runtime/tracing",
+]

@@ -1,0 +1,290 @@
+use crate as duster;
+
+use frame_support::parameter_types;
+use frame_support::traits::{Everything, Nothing, OnKilledAccount};
+
+use orml_traits::parameter_type_with_key;
+use pallet_currencies::{BasicCurrencyAdapter, MockBoundErc20, MockErc20Currency};
+
+use crate::Config;
+use frame_system as system;
+
+use sp_core::H256;
+
+use frame_support::weights::Weight;
+use frame_system::EnsureRoot;
+use hydradx_traits::evm::{Erc20Inspect, Erc20OnDust};
+use orml_traits::MultiCurrency;
+use pallet_currencies::fungibles::FungibleCurrencies;
+use primitives::EvmAddress;
+use sp_runtime::{
+	traits::{BlakeTwo256, IdentityLookup},
+	AccountId32, BuildStorage,
+};
+use sp_std::cell::RefCell;
+use sp_std::vec::Vec;
+
+type AccountId = AccountId32;
+pub type AssetId = u32;
+type Balance = u128;
+type Amount = i128;
+
+pub const TOKEN: u32 = 10u32;
+pub const ATOKEN: u32 = 1005u32;
+pub const ATOKEN_ED: u128 = 1000u128;
+
+type Block = frame_system::mocking::MockBlock<Test>;
+
+pub const ALICE: AccountId = AccountId32::new([1u8; 32]);
+pub const BOB: AccountId = AccountId32::new([2u8; 32]);
+pub const DUSTER: AccountId = AccountId32::new([3u8; 32]);
+pub const TREASURY: AccountId = AccountId32::new([4u8; 32]);
+
+thread_local! {
+	pub static ATOKEN_IDS: RefCell<Vec<AssetId>> = const { RefCell::new(vec![]) };
+}
+
+parameter_types! {
+	pub TreasuryAccount: AccountId = TREASURY;
+}
+
+frame_support::construct_runtime!(
+	pub enum Test
+	{
+		System: frame_system,
+		Duster: duster,
+		Tokens: orml_tokens,
+		Currencies: pallet_currencies,
+		Balances: pallet_balances,
+	}
+);
+
+parameter_types! {
+	pub const BlockHashCount: u64 = 250;
+	pub const MaximumBlockWeight: Weight = Weight::from_parts(1024, 0);
+	pub const MaximumBlockLength: u32 = 2 * 1024;
+
+	pub const SS58Prefix: u8 = 63;
+	pub const MaxLocks: u32 = 50;
+
+	pub const NativeExistentialDeposit: u128 = 100;
+
+	pub NativeCurrencyId: AssetId = 0;
+	pub Reward: Balance = 10_000;
+}
+
+thread_local! {
+	pub static KILLED: RefCell<Vec<AccountId32>> = const { RefCell::new(vec![]) };
+}
+
+pub struct RecordKilled;
+impl OnKilledAccount<AccountId32> for RecordKilled {
+	fn on_killed_account(who: &AccountId32) {
+		KILLED.with(|r| r.borrow_mut().push(who.clone()))
+	}
+}
+
+impl system::Config for Test {
+	type BaseCallFilter = Everything;
+	type BlockWeights = ();
+	type BlockLength = ();
+	type RuntimeOrigin = RuntimeOrigin;
+	type RuntimeCall = RuntimeCall;
+	type RuntimeTask = RuntimeTask;
+	type Nonce = u64;
+	type Block = Block;
+	type Hash = H256;
+	type Hashing = BlakeTwo256;
+	type AccountId = AccountId32;
+	type Lookup = IdentityLookup<Self::AccountId>;
+	type RuntimeEvent = RuntimeEvent;
+	type BlockHashCount = BlockHashCount;
+	type DbWeight = ();
+	type Version = ();
+	type PalletInfo = PalletInfo;
+	type AccountData = pallet_balances::AccountData<u128>;
+	type OnNewAccount = ();
+	type OnKilledAccount = RecordKilled;
+	type SystemWeightInfo = ();
+	type SS58Prefix = SS58Prefix;
+	type OnSetCode = ();
+	type MaxConsumers = frame_support::traits::ConstU32<16>;
+	type SingleBlockMigrations = ();
+	type MultiBlockMigrator = ();
+	type PreInherents = ();
+	type PostInherents = ();
+	type PostTransactions = ();
+	type ExtensionsWeightInfo = ();
+}
+
+parameter_type_with_key! {
+	pub ExistentialDeposits: |_currency_id: AssetId| -> Balance {
+		1u128
+	};
+}
+
+parameter_type_with_key! {
+	pub MinDeposits: |currency_id: AssetId| -> Balance {
+		match currency_id {
+			0 => 1000,
+			1 => 100_000,
+			&TOKEN => 1000,
+			&ATOKEN => 1000,
+			_ => 0
+		}
+	};
+}
+
+pub struct TestExtendedWhitelist;
+
+impl frame_support::traits::Get<Vec<AccountId>> for TestExtendedWhitelist {
+	fn get() -> Vec<AccountId> {
+		// Return treasury and any other hardcoded accounts that should be whitelisted
+		vec![TreasuryAccount::get()]
+	}
+}
+
+impl Config for Test {
+	type AssetId = AssetId;
+	type MultiCurrency = FungibleCurrencies<Test>;
+	type ExistentialDeposit = MinDeposits;
+	type WhitelistUpdateOrigin = EnsureRoot<AccountId>;
+	type Erc20Support = ATokenDusterMock;
+	type ExtendedWhitelist = TestExtendedWhitelist;
+	type TreasuryAccountId = TreasuryAccount;
+	type WeightInfo = ();
+}
+
+pub struct ATokenDusterMock;
+
+impl ATokenDusterMock {
+	pub fn set_atoken(asset_id: AssetId) {
+		ATOKEN_IDS.with(|ids| {
+			if !ids.borrow().contains(&asset_id) {
+				ids.borrow_mut().push(asset_id);
+			}
+		});
+	}
+}
+
+impl Erc20Inspect<AssetId> for ATokenDusterMock {
+	fn contract_address(_id: AssetId) -> Option<EvmAddress> {
+		None
+	}
+
+	fn is_atoken(asset_id: AssetId) -> bool {
+		ATOKEN_IDS.with(|ids| ids.borrow().contains(&asset_id))
+	}
+}
+
+impl Erc20OnDust<AccountId, AssetId> for ATokenDusterMock {
+	fn on_dust(
+		account: &AccountId,
+		dust_dest_account: &AccountId,
+		currency_id: AssetId,
+	) -> frame_support::dispatch::DispatchResult {
+		// Simulate the AToken withdraw and supply by transferring the balance
+		let balance = Tokens::free_balance(currency_id, account);
+		if balance < ATOKEN_ED {
+			Tokens::transfer(
+				RuntimeOrigin::signed(account.clone()),
+				dust_dest_account.clone(),
+				currency_id,
+				balance,
+			)?;
+		}
+
+		Ok(())
+	}
+}
+
+impl orml_tokens::Config for Test {
+	type Balance = Balance;
+	type Amount = Amount;
+	type CurrencyId = AssetId;
+	type WeightInfo = ();
+	type ExistentialDeposits = ExistentialDeposits;
+	type MaxLocks = ();
+	type DustRemovalWhitelist = Nothing;
+	type ReserveIdentifier = ();
+	type MaxReserves = ();
+	type CurrencyHooks = ();
+}
+
+impl pallet_currencies::Config for Test {
+	type MultiCurrency = Tokens;
+	type NativeCurrency = BasicCurrencyAdapter<Test, Balances, Amount, u32>;
+	type Erc20Currency = MockErc20Currency<Test>;
+	type BoundErc20 = MockBoundErc20<Test>;
+	type ReserveAccount = TreasuryAccount;
+	type GetNativeCurrencyId = NativeCurrencyId;
+	type RegistryInspect = MockBoundErc20<Test>;
+	type EgressHandler = pallet_currencies::MockEgressHandler<Test>;
+	type WeightInfo = ();
+}
+
+impl pallet_balances::Config for Test {
+	type MaxLocks = MaxLocks;
+	type Balance = Balance;
+	type RuntimeEvent = RuntimeEvent;
+	type DustRemoval = ();
+	type ExistentialDeposit = NativeExistentialDeposit;
+	type AccountStore = System;
+	type WeightInfo = ();
+	type MaxReserves = ();
+	type ReserveIdentifier = ();
+	type FreezeIdentifier = ();
+	type MaxFreezes = ();
+	type RuntimeHoldReason = ();
+	type RuntimeFreezeReason = ();
+	type DoneSlashHandler = ();
+}
+
+pub struct ExtBuilder {
+	endowed_accounts: Vec<(AccountId, AssetId, Balance)>,
+	native_balances: Vec<(AccountId, Balance)>,
+}
+impl Default for ExtBuilder {
+	fn default() -> Self {
+		Self {
+			endowed_accounts: vec![],
+			native_balances: vec![(TREASURY, 1_000_000)],
+		}
+	}
+}
+
+impl ExtBuilder {
+	pub fn with_balance(mut self, account: AccountId, currency_id: AssetId, amount: Balance) -> Self {
+		self.endowed_accounts.push((account, currency_id, amount));
+		self
+	}
+	pub fn with_native_balance(mut self, account: AccountId, amount: Balance) -> Self {
+		self.native_balances.push((account, amount));
+		self
+	}
+
+	pub fn build(self) -> sp_io::TestExternalities {
+		let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
+
+		pallet_balances::GenesisConfig::<Test> {
+			balances: self.native_balances,
+			dev_accounts: None,
+		}
+		.assimilate_storage(&mut t)
+		.unwrap();
+
+		orml_tokens::GenesisConfig::<Test> {
+			balances: self.endowed_accounts,
+		}
+		.assimilate_storage(&mut t)
+		.unwrap();
+
+		duster::GenesisConfig::<Test> {
+			account_whitelist: vec![TREASURY],
+		}
+		.assimilate_storage(&mut t)
+		.unwrap();
+
+		t.into()
+	}
+}

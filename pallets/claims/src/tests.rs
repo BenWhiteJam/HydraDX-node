@@ -1,7 +1,5 @@
 // This file is part of HydraDX.
-
-// Copyright (C) 2020-2021  Intergalactic, Limited (GIB).
-// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2020-2021  Intergalactic, Limited (GIB). SPDX-License-Identifier: Apache-2.0
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +13,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
 use crate::mock::*;
+use crate::{error_to_invalid, Claims, EcdsaSignature, Error, EthereumAddress, ValidTransaction, ValidateClaim};
 use frame_support::dispatch::DispatchInfo;
 use frame_support::{assert_err, assert_noop, assert_ok};
 use hex_literal::hex;
+use sp_runtime::traits::{TransactionExtension, TxBaseImplication};
+use sp_runtime::transaction_validity::TransactionSource;
+use sp_std::marker::PhantomData;
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
-	let mut ext = ExtBuilder::default().build();
+	let mut ext = ExtBuilder.build();
 	ext.execute_with(|| System::set_block_number(1));
 	ext
 }
@@ -34,15 +35,14 @@ fn claiming_works() {
 		// "I hereby claim all my xHDX tokens to wallet:2a00000000000000"
 		let signature = hex!["5b2b46b0162f4b4431f154c4b9fc5ba923690b98b0c2063720799da54cb35a354304102ede62977ba556f0b03e67710522d4b7523547c62fcdc5acea59c99aa41b"];
 
-		assert_eq!(Balances::free_balance(&ALICE), 0);
-		assert_eq!(Balances::free_balance(&BOB), 0);
+		let alice_initial_balance = Balances::free_balance(ALICE);
 
 		// Signature not consistent with origin
-		assert_noop!(ClaimsPallet::claim(Origin::signed(BOB), EcdsaSignature(signature)), Error::<Test>::NoClaimOrAlreadyClaimed);
+		assert_noop!(ClaimsPallet::claim(RuntimeOrigin::signed(BOB), EcdsaSignature(signature)), Error::<Test>::NoClaimOrAlreadyClaimed);
 
-		assert_ok!(ClaimsPallet::claim(Origin::signed(ALICE), EcdsaSignature(signature)));
+		assert_ok!(ClaimsPallet::claim(RuntimeOrigin::signed(ALICE), EcdsaSignature(signature)));
 
-		assert_eq!(Balances::free_balance(&ALICE), CLAIM_AMOUNT);
+		assert_eq!(Balances::free_balance(ALICE), alice_initial_balance + CLAIM_AMOUNT);
 	})
 }
 
@@ -50,7 +50,7 @@ fn claiming_works() {
 fn invalid_signature_fail() {
 	new_test_ext().execute_with(|| {
 		let invalid_signature = hex!["a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"];
-		assert_noop!(ClaimsPallet::claim(Origin::signed(ALICE), EcdsaSignature(invalid_signature)), Error::<Test>::InvalidEthereumSignature);
+		assert_noop!(ClaimsPallet::claim(RuntimeOrigin::signed(ALICE), EcdsaSignature(invalid_signature)), Error::<Test>::InvalidEthereumSignature);
 	})
 }
 
@@ -62,13 +62,13 @@ fn claim_cant_overflow() {
 		let signature = hex!["c8da07e0f0946c10ad9bf7fe6aafbea11a6e4a8b7ce2f5fc506dd2e024a2c56442d3c35cd8428238ac84feef02c1a6d55ccfd216e7e3d64a897ef364fc6e8ff61b"];
 		let charlie_eth_addr = EthereumAddress(hex!["8202c0af5962b750123ce1a9b12e1c30a4973557"]);
 
-		assert_eq!(Claims::<Test>::get(&charlie_eth_addr), CLAIM_AMOUNT);
-		assert_eq!(Balances::free_balance(&CHARLIE), primitives::Balance::MAX - 1);
+		assert_eq!(Claims::<Test>::get(charlie_eth_addr), CLAIM_AMOUNT);
+		assert_eq!(Balances::free_balance(CHARLIE), primitives::Balance::MAX - 2);
 
-		assert_noop!(ClaimsPallet::claim(Origin::signed(CHARLIE), EcdsaSignature(signature)), Error::<Test>::BalanceOverflow);
+		assert_noop!(ClaimsPallet::claim(RuntimeOrigin::signed(CHARLIE), EcdsaSignature(signature)), Error::<Test>::BalanceOverflow);
 
-		assert_eq!(Claims::<Test>::get(&charlie_eth_addr), CLAIM_AMOUNT);
-		assert_eq!(Balances::free_balance(&CHARLIE), primitives::Balance::MAX - 1);
+		assert_eq!(Claims::<Test>::get(charlie_eth_addr), CLAIM_AMOUNT);
+		assert_eq!(Balances::free_balance(CHARLIE), primitives::Balance::MAX - 2);
 	})
 }
 
@@ -80,9 +80,9 @@ fn zeroize_claimed_balance_works() {
 		let signature = hex!["5b2b46b0162f4b4431f154c4b9fc5ba923690b98b0c2063720799da54cb35a354304102ede62977ba556f0b03e67710522d4b7523547c62fcdc5acea59c99aa41b"];
 		let alice_eth_addr = EthereumAddress(hex!["8202c0af5962b750123ce1a9b12e1c30a4973557"]);
 
-		assert_eq!(Claims::<Test>::get(&alice_eth_addr), CLAIM_AMOUNT);
-		assert_ok!(ClaimsPallet::claim(Origin::signed(ALICE), EcdsaSignature(signature)));
-		assert_eq!(Claims::<Test>::get(&alice_eth_addr), 0);
+		assert_eq!(Claims::<Test>::get(alice_eth_addr), CLAIM_AMOUNT);
+		assert_ok!(ClaimsPallet::claim(RuntimeOrigin::signed(ALICE), EcdsaSignature(signature)));
+		assert_eq!(Claims::<Test>::get(alice_eth_addr), 0);
 	})
 }
 
@@ -91,8 +91,8 @@ fn double_claim_fail() {
 	new_test_ext().execute_with(|| {
 		let signature = hex!["5b2b46b0162f4b4431f154c4b9fc5ba923690b98b0c2063720799da54cb35a354304102ede62977ba556f0b03e67710522d4b7523547c62fcdc5acea59c99aa41b"];
 
-		assert_ok!(ClaimsPallet::claim(Origin::signed(ALICE), EcdsaSignature(signature)));
-		assert_noop!(ClaimsPallet::claim(Origin::signed(ALICE), EcdsaSignature(signature)), Error::<Test>::NoClaimOrAlreadyClaimed);
+		assert_ok!(ClaimsPallet::claim(RuntimeOrigin::signed(ALICE), EcdsaSignature(signature)));
+		assert_noop!(ClaimsPallet::claim(RuntimeOrigin::signed(ALICE), EcdsaSignature(signature)), Error::<Test>::NoClaimOrAlreadyClaimed);
 	})
 }
 
@@ -101,7 +101,7 @@ fn unsigned_claim_fail() {
 	new_test_ext().execute_with(|| {
 		let signature = hex!["5b2b46b0162f4b4431f154c4b9fc5ba923690b98b0c2063720799da54cb35a354304102ede62977ba556f0b03e67710522d4b7523547c62fcdc5acea59c99aa41b"];
 		assert_err!(
-			ClaimsPallet::claim(Origin::none(), EcdsaSignature(signature)),
+			ClaimsPallet::claim(RuntimeOrigin::none(), EcdsaSignature(signature)),
 			sp_runtime::traits::BadOrigin,
 		);
 	});
@@ -112,13 +112,21 @@ fn signed_extention_success() {
 	new_test_ext().execute_with(|| {
 		let signature = hex!["5b2b46b0162f4b4431f154c4b9fc5ba923690b98b0c2063720799da54cb35a354304102ede62977ba556f0b03e67710522d4b7523547c62fcdc5acea59c99aa41b"];
 
-		let call = <crate::Call<Test>>::claim(EcdsaSignature(signature)).into();
+		let call: &<Test as frame_system::Config>::RuntimeCall = &RuntimeCall::ClaimsPallet(crate::Call::claim{ethereum_signature: EcdsaSignature(signature)});
 		let info = DispatchInfo::default();
 
-		assert_eq!(
-			ValidateClaim::<Test>(PhantomData).validate(&ALICE, &call, &info, 150),
-			Ok(ValidTransaction::default())
+		let result = ValidateClaim::<Test>(PhantomData).validate(
+			RuntimeOrigin::signed(ALICE),
+			call,
+			&info,
+			150,
+			(),
+			&TxBaseImplication(PhantomData::<Test>),
+			TransactionSource::External
 		);
+		assert!(result.is_ok());
+		let (val, _, _) = result.unwrap();
+		assert_eq!(val, ValidTransaction::default());
 	});
 }
 
@@ -127,13 +135,20 @@ fn signed_extention_invalid_sig() {
 	new_test_ext().execute_with(|| {
 		let invalid_signature = hex!["a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"];
 
-		let call = <crate::Call<Test>>::claim(EcdsaSignature(invalid_signature)).into();
+		let call: &<Test as frame_system::Config>::RuntimeCall = &RuntimeCall::ClaimsPallet(crate::Call::claim{ethereum_signature: EcdsaSignature(invalid_signature)});
 		let info = DispatchInfo::default();
 
-		assert_eq!(
-			ValidateClaim::<Test>(PhantomData).validate(&ALICE, &call, &info, 150),
-			InvalidTransaction::Custom(Error::<Test>::InvalidEthereumSignature.as_u8()).into()
+		let result = ValidateClaim::<Test>(PhantomData).validate(
+			RuntimeOrigin::signed(ALICE),
+			call,
+			&info,
+			150,
+			(),
+			&TxBaseImplication(PhantomData::<Test>),
+			TransactionSource::External
 		);
+		assert!(result.is_err());
+		assert_eq!(result.unwrap_err(), sp_runtime::transaction_validity::TransactionValidityError::Invalid(error_to_invalid(Error::<Test>::InvalidEthereumSignature)));
 	});
 }
 
@@ -142,12 +157,75 @@ fn signed_extention_no_claim_error() {
 	new_test_ext().execute_with(|| {
 		let signature = hex!["5b2b46b0162f4b4431f154c4b9fc5ba923690b98b0c2063720799da54cb35a354304102ede62977ba556f0b03e67710522d4b7523547c62fcdc5acea59c99aa41b"];
 
-		let call = <crate::Call<Test>>::claim(EcdsaSignature(signature)).into();
+		let call: &<Test as frame_system::Config>::RuntimeCall = &RuntimeCall::ClaimsPallet(crate::Call::claim{ethereum_signature: EcdsaSignature(signature)});
 		let info = DispatchInfo::default();
 
+		let result = ValidateClaim::<Test>(PhantomData).validate(
+			RuntimeOrigin::signed(BOB),
+			call,
+			&info,
+			150,
+			(),
+			&TxBaseImplication(PhantomData::<Test>),
+			TransactionSource::External
+		);
+		assert!(result.is_err());
+		assert_eq!(result.unwrap_err(), sp_runtime::transaction_validity::TransactionValidityError::Invalid(error_to_invalid(Error::<Test>::NoClaimOrAlreadyClaimed)));
+	});
+}
+
+#[test]
+fn unsigned_claim_rejected_by_transaction_extension() {
+	new_test_ext().execute_with(|| {
+		let signature = hex!["5b2b46b0162f4b4431f154c4b9fc5ba923690b98b0c2063720799da54cb35a354304102ede62977ba556f0b03e67710522d4b7523547c62fcdc5acea59c99aa41b"];
+		let alice_eth_addr = EthereumAddress(hex!["8202c0af5962b750123ce1a9b12e1c30a4973557"]);
+
+		let call: &<Test as frame_system::Config>::RuntimeCall = &RuntimeCall::ClaimsPallet(crate::Call::claim{ethereum_signature: EcdsaSignature(signature)});
+		let info = DispatchInfo::default();
+
+		// Unsigned claim calls should be rejected at the extension level
+		let result = ValidateClaim::<Test>(PhantomData).validate(
+			RuntimeOrigin::none(),
+			call,
+			&info,
+			150,
+			(),
+			&TxBaseImplication(PhantomData::<Test>),
+			TransactionSource::External
+		);
+		assert!(result.is_err(), "Extension should reject unsigned claim calls");
 		assert_eq!(
-			ValidateClaim::<Test>(PhantomData).validate(&BOB, &call, &info, 150),
-			InvalidTransaction::Custom(Error::<Test>::NoClaimOrAlreadyClaimed.as_u8()).into()
+			result.unwrap_err(),
+			sp_runtime::transaction_validity::TransactionValidityError::Invalid(
+				sp_runtime::transaction_validity::InvalidTransaction::BadProof
+			)
+		);
+
+		// Verify no claim was processed
+		assert_eq!(Claims::<Test>::get(alice_eth_addr), CLAIM_AMOUNT);
+	});
+}
+
+#[test]
+fn unsigned_non_claim_calls_pass_through_extension() {
+	new_test_ext().execute_with(|| {
+		// A non-claim call (e.g., System::remark) should pass through even if unsigned
+		let call: &<Test as frame_system::Config>::RuntimeCall =
+			&RuntimeCall::System(frame_system::Call::remark { remark: vec![] });
+		let info = DispatchInfo::default();
+
+		let result = ValidateClaim::<Test>(PhantomData).validate(
+			RuntimeOrigin::none(),
+			call,
+			&info,
+			150,
+			(),
+			&TxBaseImplication(PhantomData::<Test>),
+			TransactionSource::External,
+		);
+		assert!(
+			result.is_ok(),
+			"Extension should pass through non-claim unsigned calls (like inherents)"
 		);
 	});
 }

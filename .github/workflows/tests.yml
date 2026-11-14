@@ -1,146 +1,384 @@
+# FIXME: https://github.com/orgs/community/discussions/50468#discussioncomment-5366823
+# This workflow won't trigger on a weights commit, which was pushed automatically from this workflow
 name: build-and-deploy
 on:
+  push:
+    branches:
+      - master
+    tags:
+      - v*
   workflow_dispatch:
+    inputs:
+      benchmark_type:
+        description: 'Benchmarking type'
+        type: choice
+        required: true
+        default: 'quick'
+        options:
+          - quick
+          - full
+      pallets_to_benchmark:
+        description: 'Comma-separated list of pallets to benchmark (optional)'
+        required: false
+        default: ''
+        type: string
   pull_request:
 
-jobs:
-  pop-runner-instance:
-    name: create and setup infrastructure for branch
-    runs-on: ubuntu-latest
-    env:
-      ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-      IS_LOCAL: ${{ github.event.pull_request.head.repo.fork == false }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      EC2_SECRET: ${{ secrets.EC2_PWD }}
-      S3_BACKEND_KEY_NAME: tf-state-${{ github.sha }}
-    outputs:
-      runner: ${{ steps.determine-runner.outputs.runner }}
-    steps:
-      - id: determine-runner
-        name: Determine runner
-        run: if $IS_LOCAL; then echo "::set-output name=runner::${{ github.sha }}"; else echo "::set-output name=runner::ubuntu-latest"; fi;
-      - name: checkout code
-        if: ${{ env.IS_LOCAL == 'true' }}
-        uses: actions/checkout@v2.1.0
-      - name: setup node
-        if: ${{ env.IS_LOCAL == 'true' }}
-        uses: actions/setup-node@v2
-        with:
-          node-version: '14'
-      - uses: hashicorp/setup-terraform@v1
-        if: ${{ env.IS_LOCAL == 'true' }}
-        with:
-          terraform_version: 0.12.25
-      - name: rewrite tf state key
-        id: tf-state-key
-        if: ${{ env.IS_LOCAL == 'true' }}
-        working-directory: ./infrastructure
-        run: sed -i 's/BRANCH_ACTOR_KEY/${{ env.S3_BACKEND_KEY_NAME }}/g' infra.tf
-      - name: Terraform Init
-        if: ${{ env.IS_LOCAL == 'true' }}
-        id: init
-        working-directory: ./infrastructure
-        run: terraform init
-      - name: Terraform plan
-        if: ${{ env.IS_LOCAL == 'true' }}
-        id: plan
-        working-directory: ./infrastructure
-        run: terraform plan -var="ec2_pwd=$EC2_SECRET" -var="branch_name=${{ steps.determine-runner.outputs.runner }}"
-      - name: Terraform apply
-        if: ${{ env.IS_LOCAL == 'true' }}
-        id: apply
-        working-directory: ./infrastructure
-        run: terraform apply -var="ec2_pwd=$EC2_SECRET" -var="branch_name=${{ steps.determine-runner.outputs.runner }}" -auto-approve
-      - name: Sleep for 20 seconds
-        if: ${{ env.IS_LOCAL == 'true' }}
-        uses: jakejarvis/wait-action@master
-        with:
-          time: '20s'
+env:
+  RELAY_CHAIN_VERSION: v0.9.28
 
+jobs:
   build:
-    needs: pop-runner-instance
-    runs-on: ${{ needs.pop-runner-instance.outputs.runner }}
+    runs-on: lark
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: git describe --tags --abbrev=0
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v1.12
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Run tests
+        run: make test-release
+      - name: Build release
+        run: time make build-release
+      - name: Version info
+        run: ./target/release/hydradx --version
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydradx
+          path: target/release/hydradx
+      - name: Upload release wasm
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydradx_runtime.compact.compressed.wasm
+          path: target/release/wbuild/hydradx-runtime/hydradx_runtime.compact.compressed.wasm
+      - name: Clippy
+        run: make clippy-all
+
+  benchmark-check:
+    runs-on: toad
+    concurrency: benchmark-execution
+    needs: build
+    permissions:
+      pull-requests: write
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Check ignore benchmarks
+        id: check-ignore
+        run: |
+          if git log -1 --pretty=format:"%s" | grep -q "\[ignore benchmarks\]"; then
+            echo "ignore=true" >> $GITHUB_OUTPUT
+          else
+            echo "ignore=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Skip benchmarks
+        if: steps.check-ignore.outputs.ignore == 'true'
+        run: |
+          echo "Skipping benchmark-check job due to ignore tag"
+          exit 0
+
+      - name: Prepare benchmark execution
+        if: steps.check-ignore.outputs.ignore == 'false'
+        id: prepare
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "benchmark_type=${{ github.event.inputs.benchmark_type }}" >> $GITHUB_OUTPUT
+          else
+            echo "benchmark_type=quick" >> $GITHUB_OUTPUT
+          fi
+          
+          pr_number=${{ github.event.number }}
+          echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
+          
+          if [[ -z "$pr_number" ]]; then
+            pr_number=$(curl -s \
+              -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${{ github.head_ref || github.ref_name }}&state=open" | \
+              grep '"number":' | \
+              sed 's/[^0-9]*//g' | \
+              head -n 1
+            )
+            echo "pr_number=$pr_number" >> $GITHUB_OUTPUT
+          
+            if [[ -z "$pr_number" ]]; then
+              echo "Warning: Could not determine PR number from either event context or API" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Setup cmake
+        if: steps.check-ignore.outputs.ignore == 'false'
+        uses: jwlawson/actions-setup-cmake@v1.12
+      - name: Install Rust
+        if: steps.check-ignore.outputs.ignore == 'false'
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: '-D warnings'
+
+      # Built here, not on lark: the binary must link against toad's glibc.
+      - name: Build benchmarks CLI
+        if: steps.check-ignore.outputs.ignore == 'false'
+        run: make build-benchmarks
+
+      - name: Run ${{ steps.prepare.outputs.benchmark_type }} benchmarks
+        if: steps.check-ignore.outputs.ignore == 'false'
+        run: |
+          BENCHMARK_FLAGS="--bin ./target/release/hydradx"
+          if [[ "${{ steps.prepare.outputs.benchmark_type }}" == "quick" ]]; then
+            BENCHMARK_FLAGS="$BENCHMARK_FLAGS --check"
+          fi
+          if [ -z "${{ github.event.inputs.pallets_to_benchmark }}" ]; then
+            ./scripts/benchmarking.sh --all $BENCHMARK_FLAGS
+          else
+            ./scripts/benchmarking.sh "${{ github.event.inputs.pallets_to_benchmark }}" $BENCHMARK_FLAGS
+          fi
+
+      - name: Upload weights directory
+        if: steps.check-ignore.outputs.ignore == 'false'
+        id: bencher-weights
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-benchmark-weights
+          path: runtime/hydradx/src/weights/
+          retention-days: 3
+
+      - name: Check with new weights
+        if: steps.check-ignore.outputs.ignore == 'false'
+        run: make check
+
+      - name: Commit full benchmark results to a pull request
+        if: steps.prepare.outputs.benchmark_type == 'full'
+        run: |
+          user="${{ github.actor }}"
+          git config --global user.name "$user"
+          git config --global user.email "${user}@users.noreply.github.com"
+
+          # Add and check if there are changes
+          git add runtime/hydradx/src/weights/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          # Commit changes
+          git commit -m "Update pallets weights [ignore benchmarks]"
+
+          # Set up authentication and push
+          # Create the authenticated URL with the token
+          repo_url="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          # Push to the branch that triggered the workflow
+          git push "${repo_url}" HEAD:${{ github.head_ref || github.ref_name }}
+
+          echo "Successfully pushed benchmark results to branch ${{ github.head_ref || github.ref_name }}"
+
+      # Weight diff for full bench runs. The standalone weight-diff workflow
+      # can't trigger off the bot's push (GITHUB_TOKEN does not retrigger
+      # workflows), so we compute and post the diff here instead. Both writers
+      # use the same `weight-diff` sticky header, so this overwrites the
+      # last comment from the standalone workflow.
+      - name: Materialize master weights for weight-diff
+        if: steps.prepare.outputs.benchmark_type == 'full'
+        run: |
+          git fetch --no-tags --depth=1 origin +master:refs/remotes/origin/master
+          mkdir -p /tmp/weights-master/runtime/hydradx/src/weights
+          git archive origin/master runtime/hydradx/src/weights 2>/dev/null \
+            | tar -x -C /tmp/weights-master || true
+
+      - name: Generate weight diff report
+        if: steps.prepare.outputs.benchmark_type == 'full'
+        id: weight-diff
+        run: |
+          set -euo pipefail
+          python3 scripts/weight-diff/weight_diff.py \
+            --old /tmp/weights-master/runtime/hydradx/src/weights \
+            --new runtime/hydradx/src/weights \
+            > weight-diff-report.md
+
+          if grep -q 'No weight changes detected' weight-diff-report.md; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "----- report preview -----"
+          head -40 weight-diff-report.md
+
+      - name: Post weight-diff comment after full bench
+        if: steps.prepare.outputs.benchmark_type == 'full' && steps.weight-diff.outputs.has_changes == 'true'
+        uses: marocchino/sticky-pull-request-comment@v2.1.0
+        with:
+          header: weight-diff
+          path: weight-diff-report.md
+          number: ${{ steps.prepare.outputs.pr_number }}
+
+      - name: Remove stale weight-diff comment after full bench (no changes)
+        if: steps.prepare.outputs.benchmark_type == 'full' && steps.weight-diff.outputs.has_changes == 'false'
+        uses: marocchino/sticky-pull-request-comment@v2.1.0
+        with:
+          header: weight-diff
+          delete: true
+          number: ${{ steps.prepare.outputs.pr_number }}
+
+      - name: Comment benchmark results to the pull request
+        if: github.event_name == 'pull_request' && steps.check-ignore.outputs.ignore == 'false'
+        uses: marocchino/sticky-pull-request-comment@v2.1.0
+        with:
+          header: 'benchmark'
+          recreate: true
+          number: ${{ steps.prepare.outputs.pr_number }}
+          message: |
+            ${{ steps.prepare.outputs.benchmark_type == 'full' && 'Full' || 'Quick' }} benchmark at commit ${{ github.event.pull_request.head.sha }} has been executed successfully.
+            [View results](${{ steps.bencher-weights.outputs.artifact-url }})
+
+  version-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    if: github.event_name == 'pull_request'
+    outputs:
+      runtime-upgraded: ${{ steps.check-runtime.outputs.upgraded }}
     steps:
       - uses: actions/checkout@v2
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - run: git describe --tags --abbrev=0
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: codota/toolchain@00a8bf2bdcfe93aefd70422d3dec07337959d3a4
         with:
           profile: minimal
-          toolchain: nightly-2021-06-01
-          target: wasm32-unknown-unknown
-          override: true
-          default: true
-      - name: Install clippy
-        run: rustup component add clippy
-      - name: Run clippy
-        run: cargo clippy --release -- -D warnings
-
-      - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin
-      - name: Test && Generate code coverage
-        run: cargo tarpaulin --all-features --workspace --locked  --exclude-files node/* --exclude-files runtime/* --exclude-files utils/* --exclude-files **/weights.rs --ignore-tests -o Xml -o lcov
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@v1
+      - name: Get crate versions
+        run: |
+          VERSION_UPDATE=$(./scripts/list_crate_updates.sh)
+          VERSION_UPDATE=$(cat << EOF
+          $VERSION_UPDATE
+          EOF
+          )
+          echo "VERSION_UPDATE<<EOF" >> $GITHUB_ENV
+          echo "$VERSION_UPDATE" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+      - name: Check runtime upgrade
+        id: check-runtime
+        if: contains(env.VERSION_UPDATE, 'Runtime version has been increased.')
+        run: echo "::set-output name=upgraded::true"
+      - name: Sticky Pull Request Comment
+        uses: marocchino/sticky-pull-request-comment@v2.1.0
         with:
-          fail_ci_if_error: true
-      - name: Build release
-        run: time cargo build --release --quiet --locked
-      - name: Version info
-        run: ./target/release/hydra-dx --version
-      - name: Upload release binary
-        uses: actions/upload-artifact@v2
-        with:
-          name: hydra-dx
-          path: target/release/hydra-dx
-      - name: Upload release wasm
-        uses: actions/upload-artifact@v2
-        with:
-          name: hydra_dx_runtime.wasm
-          path: target/release/wbuild/hydra-dx-runtime/hydra_dx_runtime.compact.wasm
+          message: |
+            ${{ env.VERSION_UPDATE }}
+      - name: Evaluate result
+        if: contains(env.VERSION_UPDATE, 'have not been updated') || contains(env.VERSION_UPDATE, 'versions don''t match') || contains(env.VERSION_UPDATE, 'downgraded')
+        run: exit 1
 
-
-  destroy-runner-instance:
-    name: destroy infra
+  ecosystem-tests:
+    needs: build  # Make sure this runs after build job to have the wasm artifact
+    permissions: { }
     runs-on: ubuntu-latest
-    needs: build
-    if: ${{ always() && github.event.pull_request.head.repo.fork == false }}
-    env:
-      ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      EC2_SECRET: ${{ secrets.EC2_PWD }}
-      S3_BACKEND_KEY_NAME: tf-state-${{ github.sha }}
+    if: false && github.event_name == 'pull_request'
     steps:
-      - name: checkout code
-        uses: actions/checkout@v2.1.0
-      - name: setup node
-        uses: actions/setup-node@v2
+      - name: Checkout polkadot-ecosystem-tests
+        uses: actions/checkout@v2
         with:
-          node-version: '14'
-      - uses: hashicorp/setup-terraform@v1
+          repository: galacticcouncil/polkadot-ecosystem-tests
+          ref: hydration-ci-tests
+
+      - name: Prepare Hydration ecosystem forks
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          endpoints_path = Path("packages/networks/src/pet-chain-endpoints.json")
+          endpoints = json.loads(endpoints_path.read_text())
+          endpoints["hydration"] = ["wss://hdx.tarn.hydration.cloud"]
+          endpoints["acala"] = ["wss://acala-rpc.aca-api.network"]
+          endpoints["assetHubPolkadot"] = ["wss://polkadot-asset-hub-rpc.polkadot.io"]
+          endpoints_path.write_text(json.dumps(endpoints, indent=2) + "\n")
+
+          utils_path = Path("packages/hydration/tests/utils.ts")
+          source = utils_path.read_text()
+          old = '''  // Step 5: Enact the authorized upgrade
+            console.log('Enacting authorized upgrade...')
+            const enact = hydraDXClient.api.tx.system.applyAuthorizedUpgrade(`0x${code}`)
+            await sendTransaction(enact.signAsync(alice))
+            // First post-upgrade block applies the new code; metadata is then refreshed.
+            await hydraDXClient.chain.newBlock()
+
+            // Disable the parachain-system relay-parent descendants check so chopsticks
+            // can keep producing blocks against runtimes that enabled slot-based
+            // collators / strict async-backing descendants (added in the gigahdx PR).
+            // We write the raw storage key directly because, right after the upgrade
+            // block, chopsticks/PJS metadata may still reflect the old runtime — looking
+            // up `Parameters.RelayParentOffsetOverride` via metadata would error.
+            // For runtimes without this storage (live mainnet) the write is harmless.
+            const relayParentOffsetOverrideKey =
+              xxhashAsHex('Parameters', 128) + xxhashAsHex('RelayParentOffsetOverride', 128).slice(2)
+            await hydraDXClient.dev.setStorage([[relayParentOffsetOverrideKey, '0x01']])
+
+            await hydraDXClient.chain.newBlock()
+            await hydraDXClient.chain.newBlock()
+
+            const newSpecVersion = hydraDXClient.api.runtimeVersion.specVersion.toNumber()
+            console.log('Spec version after upgrade: ', newSpecVersion)
+          '''
+          new = '''  // Step 5: Enact the authorized upgrade
+            console.log('Enacting authorized upgrade...')
+            // Install the Wasm on the fork head and invalidate Chopsticks' runtime caches.
+            // This avoids submitting the current Wasm as an extrinsic against the much
+            // older fork runtime while preserving the first-block migration behavior.
+            const auraCurrentSlotKey = xxhashAsHex('Aura', 128) + xxhashAsHex('CurrentSlot', 128).slice(2)
+            const relayParentOffsetOverrideKey =
+              xxhashAsHex('Parameters', 128) + xxhashAsHex('RelayParentOffsetOverride', 128).slice(2)
+            hydraDXClient.chain.head.setWasm(`0x${code}`)
+            await hydraDXClient.dev.setStorage([
+              [auraCurrentSlotKey, '0x0000000000000000'],
+              [relayParentOffsetOverrideKey, '0x01'],
+            ])
+            // The first post-upgrade block runs on_runtime_upgrade and refreshes metadata.
+            await hydraDXClient.chain.newBlock()
+
+            await hydraDXClient.chain.newBlock()
+            await hydraDXClient.chain.newBlock()
+
+            // The fork runtime changes below Polkadot.js, so reconnect to load
+            // the upgraded spec version, signed extensions, and metadata.
+            const { ApiPromise, WsProvider } = await import('@polkadot/api')
+            hydraDXClient.api = await ApiPromise.create({
+              provider: new WsProvider(hydraDXClient.url),
+              noInitWarn: true,
+            })
+
+            const newSpecVersion = hydraDXClient.api.runtimeVersion.specVersion.toNumber()
+            console.log('Spec version after upgrade: ', newSpecVersion)
+          '''
+          if source.count(old) != 1:
+              raise SystemExit("unexpected Hydration runtime-upgrade helper")
+          utils_path.write_text(source.replace(old, new, 1))
+          PY
+
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
         with:
-          terraform_version: 0.12.25
-          continue-on-error: false
-      - name: rewrite tf state key
-        id: tf-state-key
-        working-directory: ./infrastructure
-        run: sed -i 's/BRANCH_ACTOR_KEY/${{ env.S3_BACKEND_KEY_NAME }}/g' infra.tf
+          name: hydradx_runtime.compact.compressed.wasm
 
-      - name: Terraform Init
-        id: init
-        working-directory: ./infrastructure
-        run: terraform init
-        continue-on-error: false
+      - name: Run ecosystem tests
+        run: |
+          # Set the path to the downloaded WASM file
+          export HYDRADX_RUNTIME_WASM_PATH="$PWD/hydradx_runtime.compact.compressed.wasm"
 
-      - name: Terraform apply
-        id: apply
-        working-directory: ./infrastructure
-        run: terraform destroy -var="ec2_pwd=$EC2_SECRET" -var="branch_name=${{ needs.pop-runner-instance.outputs.runner }}" -auto-approve
-        continue-on-error: false
+          # Run specific tests doing XCM between hydradx and other parachains
+          yarn install
+          yarn test --no-file-parallelism packages/hydration/tests/xcm.test.ts packages/hydration/tests/dca.test.ts
+        env:
+          HYDRADX_RUNTIME_WASM_PATH: ${{ env.HYDRADX_RUNTIME_WASM_PATH }}

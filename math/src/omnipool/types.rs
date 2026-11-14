@@ -1,0 +1,477 @@
+use crate::omnipool::calculate_burn_amount_based_on_fee_taken;
+use crate::omnipool::types::BalanceUpdate::{Decrease, Increase};
+use crate::types::Balance;
+use codec::{Decode, Encode, MaxEncodedLen};
+use num_traits::{CheckedAdd, CheckedSub, SaturatingAdd};
+use scale_info::TypeInfo;
+use sp_arithmetic::traits::Saturating;
+use sp_arithmetic::{FixedPointNumber, FixedU128, Permill};
+use sp_std::ops::{Add, Deref};
+
+/// Asset state representation including asset pool reserve.
+#[derive(Clone, Default, Debug)]
+pub struct AssetReserveState<Balance> {
+	/// Quantity of asset in omnipool
+	pub reserve: Balance,
+	/// Quantity of Hub Asset matching this asset
+	pub hub_reserve: Balance,
+	/// Quantity of LP shares for this asset
+	pub shares: Balance,
+	/// Quantity of LP shares for this asset owned by protocol
+	pub protocol_shares: Balance,
+}
+
+impl<Balance> AssetReserveState<Balance>
+where
+	Balance: Into<<FixedU128 as FixedPointNumber>::Inner> + Copy + CheckedAdd + CheckedSub + Default,
+{
+	/// Calculate price for actual state
+	pub(crate) fn price(&self) -> Option<FixedU128> {
+		FixedU128::checked_from_rational(self.hub_reserve.into(), self.reserve.into())
+	}
+
+	/// Update current asset state with given delta changes.
+	pub fn delta_update(self, delta: &AssetStateChange<Balance>) -> Option<Self> {
+		Some(Self {
+			reserve: (delta.delta_reserve + self.reserve)?,
+			hub_reserve: (delta.delta_hub_reserve + self.hub_reserve)?,
+			shares: (delta.delta_shares + self.shares)?,
+			protocol_shares: (delta.delta_protocol_shares + self.protocol_shares)?,
+		})
+	}
+}
+
+/// Indicates whether delta amount should be added or subtracted.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BalanceUpdate<Balance> {
+	Increase(Balance),
+	Decrease(Balance),
+}
+
+impl<Balance: CheckedAdd + CheckedSub + PartialOrd + Copy + Default + Saturating + Copy> BalanceUpdate<Balance> {
+	/// Merge two update together
+	pub fn merge(self, other: Self) -> Option<Self> {
+		self.checked_add(&other)
+	}
+
+	fn saturating_merge(self, other: Self) -> Self {
+		self.saturating_add(&other)
+	}
+}
+
+/// The addition operator + for BalanceUpdate.
+///
+/// Panics if overflows in debug builds, in non-debug debug it wraps instead. Use `checked_add` for safe operation.
+///
+/// # Example
+///
+/// ```
+/// use crate::hydra_dx_math::omnipool::types::BalanceUpdate;
+/// assert_eq!(BalanceUpdate::Increase(100) + BalanceUpdate::Increase(100), BalanceUpdate::Increase(200));
+/// ```
+impl<Balance: CheckedAdd + CheckedSub + PartialOrd + Default> Add<Self> for BalanceUpdate<Balance> {
+	type Output = Self;
+
+	fn add(self, rhs: Self) -> Self::Output {
+		match (self, rhs) {
+			(Increase(a), Increase(b)) => BalanceUpdate::Increase(a + b),
+			(Decrease(a), Decrease(b)) => BalanceUpdate::Decrease(a + b),
+			(Increase(a), Decrease(b)) => {
+				if a >= b {
+					BalanceUpdate::Increase(a - b)
+				} else {
+					BalanceUpdate::Decrease(b - a)
+				}
+			}
+			(Decrease(a), Increase(b)) => {
+				if a >= b {
+					BalanceUpdate::Decrease(a - b)
+				} else {
+					BalanceUpdate::Increase(b - a)
+				}
+			}
+		}
+	}
+}
+
+impl<Balance: Copy + CheckedAdd + CheckedSub + PartialOrd + Default + Saturating> SaturatingAdd
+	for BalanceUpdate<Balance>
+{
+	fn saturating_add(&self, rhs: &Self) -> Self {
+		match (self, rhs) {
+			(Increase(a), Increase(b)) => BalanceUpdate::Increase(a.saturating_add(*b)),
+			(Decrease(a), Decrease(b)) => BalanceUpdate::Decrease(a.saturating_add(*b)),
+			(Increase(a), Decrease(b)) => {
+				if a >= b {
+					BalanceUpdate::Increase(a.saturating_sub(*b))
+				} else {
+					BalanceUpdate::Decrease(b.saturating_sub(*a))
+				}
+			}
+			(Decrease(a), Increase(b)) => {
+				if a >= b {
+					BalanceUpdate::Decrease(a.saturating_sub(*b))
+				} else {
+					BalanceUpdate::Increase(b.saturating_sub(*a))
+				}
+			}
+		}
+	}
+}
+
+/// Performs addition that returns `None` instead of wrapping around on overflow
+impl<Balance: CheckedAdd + CheckedSub + PartialOrd + Copy + Default> CheckedAdd for BalanceUpdate<Balance> {
+	fn checked_add(&self, v: &Self) -> Option<Self> {
+		match (self, v) {
+			(Increase(a), Increase(b)) => Some(BalanceUpdate::Increase(a.checked_add(b)?)),
+			(Decrease(a), Decrease(b)) => Some(BalanceUpdate::Decrease(a.checked_add(b)?)),
+			(Increase(a), Decrease(b)) => {
+				if a >= b {
+					Some(BalanceUpdate::Increase(a.checked_sub(b)?))
+				} else {
+					Some(BalanceUpdate::Decrease(b.checked_sub(a)?))
+				}
+			}
+			(Decrease(a), Increase(b)) => {
+				if a >= b {
+					Some(BalanceUpdate::Decrease(a.checked_sub(b)?))
+				} else {
+					Some(BalanceUpdate::Increase(b.checked_sub(a)?))
+				}
+			}
+		}
+	}
+}
+
+impl<Balance: Default> Default for BalanceUpdate<Balance> {
+	fn default() -> Self {
+		BalanceUpdate::Increase(Balance::default())
+	}
+}
+
+impl<Balance: Default> Deref for BalanceUpdate<Balance> {
+	type Target = Balance;
+
+	fn deref(&self) -> &Self::Target {
+		match self {
+			Increase(amount) | Decrease(amount) => amount,
+		}
+	}
+}
+
+impl<Balance: Into<<FixedU128 as FixedPointNumber>::Inner> + CheckedAdd + CheckedSub + Copy + Default> Add<Balance>
+	for BalanceUpdate<Balance>
+{
+	type Output = Option<Balance>;
+
+	fn add(self, rhs: Balance) -> Self::Output {
+		match &self {
+			BalanceUpdate::Increase(amount) => rhs.checked_add(amount),
+			BalanceUpdate::Decrease(amount) => rhs.checked_sub(amount),
+		}
+	}
+}
+
+/// Delta changes of asset state
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct AssetStateChange<Balance>
+where
+	Balance: Default,
+{
+	pub delta_reserve: BalanceUpdate<Balance>,
+	pub delta_hub_reserve: BalanceUpdate<Balance>,
+	pub delta_shares: BalanceUpdate<Balance>,
+	pub delta_protocol_shares: BalanceUpdate<Balance>,
+	pub extra_hub_reserve_amount: BalanceUpdate<Balance>,
+}
+impl<
+		Balance: Into<<FixedU128 as FixedPointNumber>::Inner>
+			+ CheckedAdd
+			+ CheckedSub
+			+ Copy
+			+ Default
+			+ PartialOrd
+			+ sp_std::fmt::Debug
+			+ Saturating,
+	> AssetStateChange<Balance>
+{
+	pub fn total_delta_hub_reserve(&self) -> BalanceUpdate<Balance> {
+		self.delta_hub_reserve.saturating_merge(self.extra_hub_reserve_amount)
+	}
+
+	fn account_for_fee_taken(self, amt_to_burn: Balance) -> Self {
+		let mut v = self;
+		debug_assert!(
+			*v.extra_hub_reserve_amount >= amt_to_burn,
+			"Amount to burn {:?} > to mint {:?}",
+			amt_to_burn,
+			v.extra_hub_reserve_amount
+		);
+		v.extra_hub_reserve_amount = v
+			.extra_hub_reserve_amount
+			.saturating_merge(BalanceUpdate::Decrease(amt_to_burn));
+		v
+	}
+}
+
+/// Information about trade fee amounts
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct TradeFee<Balance> {
+	pub asset_fee: Balance,
+	// Total protocol fee amount ( includes burned portion)
+	pub protocol_fee: Balance,
+	// Burned portion of protocol fee amount
+	pub burned_protocol_fee: Balance,
+}
+
+/// Delta changes after a trade is executed
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct TradeStateChange<Balance>
+where
+	Balance: Default,
+{
+	pub asset_in: AssetStateChange<Balance>,
+	pub asset_out: AssetStateChange<Balance>,
+	pub fee: TradeFee<Balance>,
+}
+
+impl TradeStateChange<crate::types::Balance> {
+	pub fn account_for_fee_taken(self, taken_fee: crate::types::Balance) -> Self {
+		let mut v = self;
+		let extra_amt =
+			calculate_burn_amount_based_on_fee_taken(taken_fee, v.fee.asset_fee, *v.asset_out.extra_hub_reserve_amount);
+		v.asset_out = v.asset_out.account_for_fee_taken(extra_amt);
+		v
+	}
+}
+
+/// Delta changes after a trade with hub asset is executed.
+#[derive(Default, Debug)]
+pub struct HubTradeStateChange<Balance>
+where
+	Balance: Default,
+{
+	pub asset: AssetStateChange<Balance>,
+	pub fee: TradeFee<Balance>,
+}
+
+impl HubTradeStateChange<crate::types::Balance> {
+	pub fn account_for_fee_taken(self, taken_fee: crate::types::Balance) -> Self {
+		let mut v = self;
+		let extra_amt =
+			calculate_burn_amount_based_on_fee_taken(taken_fee, v.fee.asset_fee, *v.asset.extra_hub_reserve_amount);
+		v.asset = v.asset.account_for_fee_taken(extra_amt);
+		v
+	}
+}
+
+/// Delta changes after add or remove liquidity.
+#[derive(Default)]
+pub struct LiquidityStateChange<Balance>
+where
+	Balance: Default,
+{
+	pub asset: AssetStateChange<Balance>,
+	pub delta_position_reserve: BalanceUpdate<Balance>,
+	pub delta_position_shares: BalanceUpdate<Balance>,
+	pub lp_hub_amount: Balance,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Position<Balance> {
+	/// Amount of asset added to omnipool
+	pub amount: Balance,
+	/// Quantity of LP shares owned by LP
+	pub shares: Balance,
+	/// Price at which liquidity was provided
+	pub price: (Balance, Balance),
+}
+
+impl<Balance> Position<Balance>
+where
+	Balance: Into<<FixedU128 as FixedPointNumber>::Inner> + Copy + CheckedAdd + CheckedSub + Default,
+{
+	pub fn price(&self) -> Option<FixedU128> {
+		FixedU128::checked_from_rational(self.price.0.into(), self.price.1.into())
+	}
+}
+
+/// Slip fee parameters for a two-asset trade.
+/// Single struct bundles both sides — either slip fees are fully enabled
+/// (both in and out) or fully disabled (None). No slip_factor field needed;
+/// s is either 0 (caller passes None) or 1 (caller passes Some).
+pub struct TradeSlipFees {
+	/// Q₀ for sell-side asset (hub reserve at block start)
+	pub asset_in_hub_reserve: Balance,
+	/// Cumulative hub asset delta for sell-side asset before this trade
+	pub asset_in_delta: SignedBalance,
+	/// Q₀ for buy-side asset (hub reserve at block start)
+	pub asset_out_hub_reserve: Balance,
+	/// Cumulative hub asset delta for buy-side asset before this trade
+	pub asset_out_delta: SignedBalance,
+	/// Maximum slip fee rate (per-side cap, shared)
+	pub max_slip_fee: Permill,
+}
+
+/// Slip fee parameters for a hub asset trade (one-sided — buy side only).
+/// Used by `calculate_sell_hub_state_changes` and `calculate_buy_for_hub_asset_state_changes`.
+pub struct HubTradeSlipFees {
+	/// Q₀ for the target asset (hub reserve at block start)
+	pub asset_hub_reserve: Balance,
+	/// Cumulative hub asset delta for the target asset before this trade
+	pub asset_delta: SignedBalance,
+	/// Maximum slip fee rate (per-side cap)
+	pub max_slip_fee: Permill,
+}
+
+/// Signed balance type that stores an unsigned `Balance` (u128) plus a sign variant.
+/// Eliminates overflow risk from `u128 as i128` casts when tracking cumulative hub asset deltas.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Encode, Decode, MaxEncodedLen, TypeInfo)]
+pub enum SignedBalance {
+	Positive(Balance),
+	Negative(Balance),
+}
+
+impl SignedBalance {
+	pub fn zero() -> Self {
+		SignedBalance::Positive(0)
+	}
+
+	pub fn is_positive(&self) -> bool {
+		matches!(self, SignedBalance::Positive(v) if *v > 0)
+	}
+
+	pub fn is_negative(&self) -> bool {
+		matches!(self, SignedBalance::Negative(v) if *v > 0)
+	}
+
+	pub fn is_zero(&self) -> bool {
+		self.abs() == 0
+	}
+
+	pub fn abs(&self) -> Balance {
+		match self {
+			SignedBalance::Positive(v) | SignedBalance::Negative(v) => *v,
+		}
+	}
+
+	pub fn negate(self) -> Self {
+		match self {
+			SignedBalance::Positive(v) => SignedBalance::Negative(v),
+			SignedBalance::Negative(v) => SignedBalance::Positive(v),
+		}
+	}
+
+	/// Add two signed balances: handles all sign combinations with checked arithmetic.
+	pub fn checked_add(self, other: Self) -> Option<Self> {
+		match (self, other) {
+			(SignedBalance::Positive(a), SignedBalance::Positive(b)) => {
+				Some(SignedBalance::Positive(a.checked_add(b)?))
+			}
+			(SignedBalance::Negative(a), SignedBalance::Negative(b)) => {
+				Some(SignedBalance::Negative(a.checked_add(b)?))
+			}
+			(SignedBalance::Positive(a), SignedBalance::Negative(b))
+			| (SignedBalance::Negative(b), SignedBalance::Positive(a)) => {
+				if a >= b {
+					Some(SignedBalance::Positive(a - b))
+				} else {
+					Some(SignedBalance::Negative(b - a))
+				}
+			}
+		}
+	}
+
+	/// Apply signed value to unsigned balance: balance + self → Option<Balance>.
+	/// Returns None if result would be negative.
+	pub fn add_to_unsigned(self, balance: Balance) -> Option<Balance> {
+		match self {
+			SignedBalance::Positive(v) => balance.checked_add(v),
+			SignedBalance::Negative(v) => balance.checked_sub(v),
+		}
+	}
+}
+
+impl Default for SignedBalance {
+	fn default() -> Self {
+		Self::zero()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::BalanceUpdate;
+	use super::CheckedAdd;
+	//use cool_asserts::assert_panics;
+	use test_case::test_case;
+
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Increase(100), BalanceUpdate::Increase(200) ; "When both increase")]
+	#[test_case(BalanceUpdate::Increase(500), BalanceUpdate::Decrease(300), BalanceUpdate::Increase(200) ; "When increase and decrease")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(300), BalanceUpdate::Decrease(200) ; "When increase and decrease larger")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Increase(0), BalanceUpdate::Increase(100) ; "When increase and increase by zero")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(0), BalanceUpdate::Increase(100) ; "When increase and decrease by zero")]
+	#[test_case(BalanceUpdate::Increase(0), BalanceUpdate::Decrease(100), BalanceUpdate::Decrease(100) ; "When increase zero and decrease ")]
+	#[test_case(BalanceUpdate::Decrease(100), BalanceUpdate::Decrease(300), BalanceUpdate::Decrease(400) ; "When both decrease ")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(100), BalanceUpdate::Decrease(100) ; "When decrease and increase")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(300), BalanceUpdate::Increase(100) ; "When decrease and increase larger")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(0), BalanceUpdate::Decrease(200) ; "When decrease and increase zero")]
+	#[test_case(BalanceUpdate::Decrease(0), BalanceUpdate::Decrease(100), BalanceUpdate::Decrease(100) ; "When decrease zero and decreaes ")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(100), BalanceUpdate::Increase(0) ; "When decrease and decrease same amount ")]
+	#[test_case(BalanceUpdate::Decrease(100), BalanceUpdate::Increase(100), BalanceUpdate::Decrease(0) ; "When decrease and decrease same amount swapped ")] // should be probably same as previous ?
+	#[test_case(BalanceUpdate::Increase(u32::MAX), BalanceUpdate::Decrease(1), BalanceUpdate::Increase(u32::MAX - 1) ; "When increase max and decrease one")]
+	//#[test_case(BalanceUpdate::Increase(u32::MAX), BalanceUpdate::Increase(1), BalanceUpdate::Increase(u32::MAX - 1) ; "When increase overflows")]
+	fn balance_update_add(x: BalanceUpdate<u32>, y: BalanceUpdate<u32>, result: BalanceUpdate<u32>) {
+		assert_eq!(x + y, result);
+	}
+
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Increase(100), Some(BalanceUpdate::Increase(200)) ; "When both increase")]
+	#[test_case(BalanceUpdate::Increase(500), BalanceUpdate::Decrease(300), Some(BalanceUpdate::Increase(200)) ; "When increase and decrease")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(300), Some(BalanceUpdate::Decrease(200)) ; "When increase and decrease larger")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Increase(0), Some(BalanceUpdate::Increase(100)) ; "When increase and increase by zero")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(0), Some(BalanceUpdate::Increase(100)) ; "When increase and decrease by zero")]
+	#[test_case(BalanceUpdate::Increase(0), BalanceUpdate::Decrease(100), Some(BalanceUpdate::Decrease(100)) ; "When increase zero and decrease ")]
+	#[test_case(BalanceUpdate::Decrease(100), BalanceUpdate::Decrease(300), Some(BalanceUpdate::Decrease(400)) ; "When both decrease ")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(100), Some(BalanceUpdate::Decrease(100)) ; "When decrease and increase")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(300), Some(BalanceUpdate::Increase(100)) ; "When decrease and increase larger")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(0), Some(BalanceUpdate::Decrease(200)) ; "When decrease and increase zero")]
+	#[test_case(BalanceUpdate::Decrease(0), BalanceUpdate::Decrease(100), Some(BalanceUpdate::Decrease(100)) ; "When decrease zero and decreaes ")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(100), Some(BalanceUpdate::Increase(0)) ; "When decrease and decrease same amount ")]
+	#[test_case(BalanceUpdate::Decrease(100), BalanceUpdate::Increase(100), Some(BalanceUpdate::Decrease(0)) ; "When decrease and decrease same amount swapped ")] // should be probably same as previous ?
+	#[test_case(BalanceUpdate::Increase(u32::MAX), BalanceUpdate::Decrease(1), Some(BalanceUpdate::Increase(u32::MAX - 1)) ; "When increase max and decrease one")]
+	#[test_case(BalanceUpdate::Increase(u32::MAX), BalanceUpdate::Increase(1), None ; "When increase overflows")]
+	#[test_case(BalanceUpdate::Decrease(u32::MAX), BalanceUpdate::Decrease(1), None ; "When decrease overflows")]
+	fn balance_update_checked_add(x: BalanceUpdate<u32>, y: BalanceUpdate<u32>, result: Option<BalanceUpdate<u32>>) {
+		assert_eq!(x.checked_add(&y), result);
+	}
+
+	#[test]
+	fn balance_update_to_balance_addition_works() {
+		let zero = 0u32;
+		assert_eq!(BalanceUpdate::Increase(100u32) + 200u32, Some(300));
+		assert_eq!(BalanceUpdate::Decrease(50u32) + 100u32, Some(50));
+		assert_eq!(BalanceUpdate::Decrease(50u32) + 50u32, Some(0));
+		assert_eq!(BalanceUpdate::Decrease(50u32) + zero, None);
+		assert_eq!(BalanceUpdate::Increase(50u32) + zero, Some(50));
+		assert_eq!(BalanceUpdate::Decrease(100u32) + 50u32, None);
+	}
+
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Increase(100), BalanceUpdate::Increase(200) ; "When both increase")]
+	#[test_case(BalanceUpdate::Increase(500), BalanceUpdate::Decrease(300), BalanceUpdate::Increase(200) ; "When increase and decrease")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(300), BalanceUpdate::Decrease(200) ; "When increase and decrease larger")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Increase(0), BalanceUpdate::Increase(100) ; "When increase and increase by zero")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(0), BalanceUpdate::Increase(100) ; "When increase and decrease by zero")]
+	#[test_case(BalanceUpdate::Increase(0), BalanceUpdate::Decrease(100), BalanceUpdate::Decrease(100) ; "When increase zero and decrease ")]
+	#[test_case(BalanceUpdate::Decrease(100), BalanceUpdate::Decrease(300), BalanceUpdate::Decrease(400) ; "When both decrease ")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(100), BalanceUpdate::Decrease(100) ; "When decrease and increase")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(300), BalanceUpdate::Increase(100) ; "When decrease and increase larger")]
+	#[test_case(BalanceUpdate::Decrease(200), BalanceUpdate::Increase(0), BalanceUpdate::Decrease(200) ; "When decrease and increase zero")]
+	#[test_case(BalanceUpdate::Decrease(0), BalanceUpdate::Decrease(100), BalanceUpdate::Decrease(100) ; "When decrease zero and decreases ")]
+	#[test_case(BalanceUpdate::Increase(100), BalanceUpdate::Decrease(100), BalanceUpdate::Increase(0) ; "When decrease and decrease same amount ")]
+	#[test_case(BalanceUpdate::Decrease(100), BalanceUpdate::Increase(100), BalanceUpdate::Decrease(0) ; "When decrease and decrease same amount swapped ")]
+	#[test_case(BalanceUpdate::Increase(u32::MAX), BalanceUpdate::Decrease(1), BalanceUpdate::Increase(u32::MAX - 1) ; "When increase max and decrease one")]
+	#[test_case(BalanceUpdate::Increase(u32::MAX), BalanceUpdate::Increase(1), BalanceUpdate::Increase(u32::MAX); "When increase overflows")]
+	#[test_case(BalanceUpdate::Decrease(u32::MAX), BalanceUpdate::Decrease(1), BalanceUpdate::Decrease(u32::MAX); "When decrease overflows")]
+	fn balance_update_saturating_add(x: BalanceUpdate<u32>, y: BalanceUpdate<u32>, result: BalanceUpdate<u32>) {
+		assert_eq!(x.saturating_merge(y), result);
+	}
+}

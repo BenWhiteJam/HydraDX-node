@@ -1,39 +1,32 @@
 [package]
-authors = ['GalacticCouncil']
-edition = '2018'
-name = 'primitives'
-version = '4.2.0'
-
-[build-dependencies]
-substrate-wasm-builder = {package = 'substrate-wasm-builder', version = '3.0.0'}
-
-# alias "parity-scale-code" to "codec"
-[dependencies.codec]
-default-features = false
-features = ['derive']
-package = 'parity-scale-codec'
-version = '2.0.0'
+name = "primitives"
+version = "6.5.0"
+authors = ["GalacticCouncil"]
+edition = "2021"
+repository = "https://github.com/galacticcouncil/HydraDX-node"
 
 [dependencies]
-primitive-types = {default-features = false, version = '0.8.0'}
-serde = {features = ['derive'], optional = true, version = '1.0.101'}
+codec = { workspace = true }
+scale-info = { workspace = true }
+serde = { workspace = true, optional = true }
+hex-literal = { workspace = true }
+static_assertions = { workspace = true }
 
 # Substrate dependencies
-frame-support = {default-features = false, version = '3.0.0'}
-frame-system = {default-features = false, version = '3.0.0'}
-sp-std = {default-features = false, version = '3.0.0'}
+frame-support = { workspace = true }
+sp-core = { workspace = true }
+sp-std = { workspace = true }
 
-[dev-dependencies]
-sp-core = {default-features = false, version = '3.0.0'}
-sp-io = {default-features = false, version = '3.0.0'}
-sp-runtime = {default-features = false, version = '3.0.0'}
+# Polkadot dependencies
+polkadot-primitives = { workspace = true }
 
 [features]
-default = ['std']
+default = ["std"]
 std = [
-  'codec/std',
-  'primitive-types/std',
-  'serde',
-  'frame-support/std',
-  'sp-std/std',
+    "serde",
+    "codec/std",
+    "scale-info/std",
+    "frame-support/std",
+    "polkadot-primitives/std",
+    "sp-core/std",
 ]

@@ -1,189 +1,422 @@
-//! A collection of node-specific RPC methods.
-//! Substrate provides the `sc-rpc` crate, which defines the core RPC layer
-//! used by Substrate nodes. This file extends those RPC definitions with
-//! capabilities that are specific to this project's runtime configuration.
-
-#![warn(missing_docs)]
+//                    :                     $$\   $$\                 $$\                    $$$$$$$\  $$\   $$\
+//                  !YJJ^                   $$ |  $$ |                $$ |                   $$  __$$\ $$ |  $$ |
+//                7B5. ~B5^                 $$ |  $$ |$$\   $$\  $$$$$$$ | $$$$$$\  $$$$$$\  $$ |  $$ |\$$\ $$  |
+//             .?B@G    ~@@P~               $$$$$$$$ |$$ |  $$ |$$  __$$ |$$  __$$\ \____$$\ $$ |  $$ | \$$$$  /
+//           :?#@@@Y    .&@@@P!.            $$  __$$ |$$ |  $$ |$$ /  $$ |$$ |  \__|$$$$$$$ |$$ |  $$ | $$  $$<
+//         ^?J^7P&@@!  .5@@#Y~!J!.          $$ |  $$ |$$ |  $$ |$$ |  $$ |$$ |     $$  __$$ |$$ |  $$ |$$  /\$$\
+//       ^JJ!.   :!J5^ ?5?^    ^?Y7.        $$ |  $$ |\$$$$$$$ |\$$$$$$$ |$$ |     \$$$$$$$ |$$$$$$$  |$$ /  $$ |
+//     ~PP: 7#B5!.         :?P#G: 7G?.      \__|  \__| \____$$ | \_______|\__|      \_______|\_______/ \__|  \__|
+//  .!P@G    7@@@#Y^    .!P@@@#.   ~@&J:              $$\   $$ |
+//  !&@@J    :&@@@@P.   !&@@@@5     #@@P.             \$$$$$$  |
+//   :J##:   Y@@&P!      :JB@@&~   ?@G!                \______/
+//     .?P!.?GY7:   .. .    ^?PP^:JP~
+//       .7Y7.  .!YGP^ ?BP?^   ^JJ^         This file is part of https://github.com/galacticcouncil/HydraDX-node
+//         .!Y7Y#@@#:   ?@@@G?JJ^           Built with <3 for decentralisation.
+//            !G@@@Y    .&@@&J:
+//              ^5@#.   7@#?.               Copyright (C) 2021-2023  Intergalactic, Limited (GIB).
+//                :5P^.?G7.                 SPDX-License-Identifier: Apache-2.0
+//                  :?Y!                    Licensed under the Apache License, Version 2.0 (the "License");
+//                                          you may not use this file except in compliance with the License.
+//                                          http://www.apache.org/licenses/LICENSE-2.0
 
 use std::sync::Arc;
 
-use hydra_dx_runtime::{opaque::Block, AccountId, AssetId, Balance, BlockNumber, Hash, Index};
-use sc_consensus_babe::Epoch;
-use sc_consensus_babe_rpc::BabeRpcHandler;
-use sc_finality_grandpa::FinalityProofProvider;
-use sc_finality_grandpa_rpc::GrandpaRpcHandler;
-pub use sc_rpc_api::DenyUnsafe;
-use sp_api::ProvideRuntimeApi;
-use sp_block_builder::BlockBuilder;
+use crate::ice_solver_worker::IceSolverTaskData;
+use cumulus_primitives_core::PersistedValidationData;
+use cumulus_primitives_parachain_inherent::ParachainInherentData;
+use cumulus_test_relay_sproof_builder::RelayStateSproofBuilder;
+use fc_db::kv::Backend as FrontierBackend;
+pub use fc_rpc::{EthBlockDataCacheTask, StorageOverride, StorageOverrideHandler};
+pub use fc_rpc_core::types::{FeeHistoryCache, FeeHistoryCacheLimit, FilterPool};
+use fp_rpc::{ConvertTransaction, ConvertTransactionRuntimeApi, EthereumRuntimeRPCApi};
+use hydradx_runtime::{opaque::Block, AccountId, Balance, Index};
+use sc_client_api::{
+	backend::{Backend, StateBackend, StorageProvider},
+	client::BlockchainEvents,
+	BlockBackend, ProofProvider,
+};
+use sc_network::service::traits::NetworkService;
+use sc_network_sync::SyncingService;
+use sc_rpc::SubscriptionTaskExecutor;
+use sc_transaction_pool_api::TransactionPool;
+use sp_api::{CallApiAt, ProvideRuntimeApi};
+use sp_block_builder::BlockBuilder as BlockBuilderApi;
 use sp_blockchain::{Error as BlockChainError, HeaderBackend, HeaderMetadata};
-use sp_consensus::SelectChain;
-use sp_consensus_babe::BabeApi;
-use sp_keystore::SyncCryptoStorePtr;
-use sp_transaction_pool::TransactionPool;
+use sp_runtime::traits::{BlakeTwo256, Block as BlockT};
+
+pub struct HydraDxEthConfig<C, BE>(std::marker::PhantomData<(C, BE)>);
+
+impl<C, BE> fc_rpc::EthConfig<Block, C> for HydraDxEthConfig<C, BE>
+where
+	C: sc_client_api::StorageProvider<Block, BE> + Sync + Send + 'static,
+	BE: Backend<Block> + 'static,
+{
+	type EstimateGasAdapter = ();
+	type RuntimeStorageOverride = fc_rpc::frontier_backend_client::SystemAccountId20StorageOverride<Block, C, BE>;
+}
 
 /// Full client dependencies.
-pub struct FullDeps<C, P, SC, B> {
+pub struct FullDeps<C, P, B> {
 	/// The client instance to use.
 	pub client: Arc<C>,
 	/// Transaction pool instance.
 	pub pool: Arc<P>,
-	/// The SelectChain Strategy
-	pub select_chain: SC,
-	/// A copy of the chain spec.
-	pub chain_spec: Box<dyn sc_chain_spec::ChainSpec>,
-	/// Whether to deny unsafe calls
-	pub deny_unsafe: DenyUnsafe,
-	/// BABE specific dependencies.
-	pub babe: BabeDeps,
-	/// GRANDPA specific dependencies.
-	pub grandpa: GrandpaDeps<B>,
+	/// Backend used by the node.
+	pub backend: Arc<B>,
+	/// Data provided from the ICE solver worker.
+	pub ice_solver_task_data: Arc<IceSolverTaskData>,
+	/// Status handle of the running PEPL worker; `None` when no worker runs on this node.
+	pub pepl_status: Option<Arc<pepl_worker::WorkerStatus>>,
+	/// Block guard state and pool handle; `None` when the guard is off.
+	pub cerebro_guard: Option<(
+		Arc<crate::cerebro_guard::Shared>,
+		Arc<dyn crate::cerebro_guard::rpc::PoolControl>,
+	)>,
 }
 
-/// Light client extra dependencies.
-pub struct LightDeps<C, F, P> {
+/// `liquidation_*` RPCs: the only external signal that the liquidation worker is alive and what
+/// it covers. Unregistering them turns a dead worker into a silent one.
+pub mod liquidation {
+	use jsonrpsee::{
+		core::{async_trait, RpcResult},
+		proc_macros::rpc,
+	};
+	use std::sync::Arc;
+
+	/// `(pool, borrower)` as 0x-hex, one entry per covered borrower per market.
+	#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+	pub struct CoveredBorrower {
+		pub pool: String,
+		pub borrower: String,
+	}
+
+	#[rpc(client, server)]
+	pub trait LiquidationWorkerApi {
+		#[method(name = "liquidation_getBorrowers")]
+		async fn get_borrowers(&self) -> RpcResult<Vec<CoveredBorrower>>;
+
+		#[method(name = "liquidation_isRunning")]
+		async fn is_running(&self) -> RpcResult<bool>;
+
+		/// The oracle fast path's per-block submission cap. Kept under the v1 name for existing
+		/// monitors, but v1 returned a weight-derived cap that bounded every submission path; in v2
+		/// the per-block scan is uncapped by design and this value does not bound it.
+		#[method(name = "liquidation_maxTransactionsPerBlock")]
+		async fn max_transactions_per_block(&self) -> RpcResult<usize>;
+
+		/// Block of the worker's most recent completed scan — lets a monitor see a worker that is
+		/// alive but falling behind, which `isRunning` alone cannot express.
+		#[method(name = "liquidation_lastScannedBlock")]
+		async fn last_scanned_block(&self) -> RpcResult<u32>;
+	}
+
+	pub struct LiquidationWorker {
+		status: Option<Arc<pepl_worker::WorkerStatus>>,
+	}
+
+	impl LiquidationWorker {
+		pub fn new(status: Option<Arc<pepl_worker::WorkerStatus>>) -> Self {
+			Self { status }
+		}
+	}
+
+	#[async_trait]
+	impl LiquidationWorkerApiServer for LiquidationWorker {
+		async fn get_borrowers(&self) -> RpcResult<Vec<CoveredBorrower>> {
+			let Some(status) = self.status.as_ref() else {
+				return Ok(Vec::new());
+			};
+			Ok(status
+				.borrowers()
+				.into_iter()
+				.map(|(pool, borrower)| CoveredBorrower {
+					pool: format!("{pool:?}"),
+					borrower: format!("{borrower:?}"),
+				})
+				.collect())
+		}
+
+		async fn is_running(&self) -> RpcResult<bool> {
+			Ok(self.status.as_ref().is_some_and(|s| s.is_running()))
+		}
+
+		async fn max_transactions_per_block(&self) -> RpcResult<usize> {
+			Ok(self
+				.status
+				.as_ref()
+				.map(|s| s.liquidations_per_block() as usize)
+				.unwrap_or_default())
+		}
+
+		async fn last_scanned_block(&self) -> RpcResult<u32> {
+			Ok(self.status.as_ref().map(|s| s.last_scanned_block()).unwrap_or_default())
+		}
+	}
+}
+
+/// Extra dependencies for Ethereum compatibility.
+pub struct Deps<C, P, CT> {
 	/// The client instance to use.
 	pub client: Arc<C>,
 	/// Transaction pool instance.
 	pub pool: Arc<P>,
-	/// Remote access to the blockchain (async).
-	pub remote_blockchain: Arc<dyn sc_client_api::light::RemoteBlockchain<Block>>,
-	/// Fetcher instance.
-	pub fetcher: Arc<F>,
+	/// Graph pool instance.
+	pub graph: Arc<P>,
+	/// Ethereum transaction converter.
+	pub converter: Option<CT>,
+	/// The Node authority flag
+	pub is_authority: bool,
+	/// Whether to enable dev signer
+	pub enable_dev_signer: bool,
+	/// Network service
+	pub network: Arc<dyn NetworkService>,
+	/// Chain syncing service
+	pub sync: Arc<SyncingService<Block>>,
+	/// Frontier Backend.
+	pub frontier_backend: Arc<FrontierBackend<Block, C>>,
+	/// Ethereum data access overrides.
+	pub overrides: Arc<dyn StorageOverride<Block>>,
+	/// Cache for Ethereum block data.
+	pub block_data_cache: Arc<EthBlockDataCacheTask<Block>>,
+	/// EthFilterApi pool.
+	pub filter_pool: FilterPool,
+	/// Maximum number of logs in a query.
+	pub max_past_logs: u32,
+	/// Fee history cache.
+	pub fee_history_cache: FeeHistoryCache,
+	/// Maximum fee history cache size.
+	pub fee_history_cache_limit: FeeHistoryCacheLimit,
+	/// Maximum allowed gas limit will be ` block.gas_limit *
+	/// execute_gas_limit_multiplier` when using eth_call/eth_estimateGas.
+	pub execute_gas_limit_multiplier: u64,
 }
 
-/// Extra dependencies for BABE.
-pub struct BabeDeps {
-	/// BABE protocol config.
-	pub babe_config: sc_consensus_babe::Config,
-	/// BABE pending epoch changes.
-	pub shared_epoch_changes: sc_consensus_epochs::SharedEpochChanges<Block, Epoch>,
-	/// The keystore that manages the keys of the node.
-	pub keystore: SyncCryptoStorePtr,
-}
-
-/// Extra dependencies for GRANDPA
-pub struct GrandpaDeps<B> {
-	/// Voting round info.
-	pub shared_voter_state: sc_finality_grandpa::SharedVoterState,
-	/// Authority set info.
-	pub shared_authority_set: sc_finality_grandpa::SharedAuthoritySet<Hash, BlockNumber>,
-	/// Receives notifications about justification events from Grandpa.
-	pub justification_stream: sc_finality_grandpa::GrandpaJustificationStream<Block>,
-	/// Executor to drive the subscription manager in the Grandpa RPC handler.
-	pub subscription_executor: sc_rpc::SubscriptionTaskExecutor,
-	/// Finality proof provider.
-	pub finality_provider: Arc<FinalityProofProvider<B, Block>>,
-}
-
-/// A IO handler that uses all Full RPC extensions.
-pub type IoHandler = jsonrpc_core::IoHandler<sc_rpc::Metadata>;
+/// RPC Extension Builder
+pub type RpcExtension = jsonrpsee::RpcModule<()>;
 
 /// Instantiate all full RPC extensions.
-pub fn create_full<C, P, SC, B>(deps: FullDeps<C, P, SC, B>) -> jsonrpc_core::IoHandler<sc_rpc::Metadata>
+pub fn create_full<C, P, B>(deps: FullDeps<C, P, B>) -> Result<RpcExtension, Box<dyn std::error::Error + Send + Sync>>
 where
-	C: ProvideRuntimeApi<Block>,
+	C: ProvideRuntimeApi<Block> + BlockBackend<Block> + ProofProvider<Block>,
 	C: HeaderBackend<Block> + HeaderMetadata<Block, Error = BlockChainError>,
 	C: Send + Sync + 'static,
 	C::Api: substrate_frame_rpc_system::AccountNonceApi<Block, AccountId, Index>,
 	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<Block, Balance>,
-	C::Api: BabeApi<Block>,
-	C::Api: BlockBuilder<Block>,
-	C::Api: pallet_xyk_rpc::XYKRuntimeApi<Block, AccountId, AssetId, Balance>,
+	C::Api: BlockBuilderApi<Block>,
 	P: TransactionPool + Sync + Send + 'static,
-	SC: SelectChain<Block> + 'static,
 	B: sc_client_api::Backend<Block> + Send + Sync + 'static,
-	B::State: sc_client_api::StateBackend<sp_runtime::traits::HashFor<Block>>,
+	B::State: sc_client_api::StateBackend<sp_runtime::traits::HashingFor<Block>>,
 {
-	use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApi};
-	use pallet_xyk_rpc::{XYKApi, XYK};
-	use substrate_frame_rpc_system::{FullSystem, SystemApi};
+	use crate::ice_solver_worker::rpc::{IceSolverWorker, IceSolverWorkerApiServer};
+	use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApiServer};
+	use substrate_frame_rpc_system::{System, SystemApiServer};
+	use substrate_state_trie_migration_rpc::{StateMigration, StateMigrationApiServer};
 
-	let mut io = jsonrpc_core::IoHandler::default();
+	use liquidation::{LiquidationWorker, LiquidationWorkerApiServer};
+
+	let mut module = RpcExtension::new(());
 	let FullDeps {
 		client,
 		pool,
-		select_chain,
-		chain_spec: _,
-		deny_unsafe,
-		babe,
-		grandpa,
+		backend,
+		ice_solver_task_data,
+		pepl_status,
+		cerebro_guard,
 	} = deps;
 
-	let BabeDeps {
-		keystore,
-		babe_config,
-		shared_epoch_changes,
-	} = babe;
-	let GrandpaDeps {
-		shared_voter_state,
-		shared_authority_set,
-		justification_stream,
-		subscription_executor,
-		finality_provider,
-	} = grandpa;
+	if let Some((shared, pool)) = cerebro_guard {
+		use crate::cerebro_guard::rpc::{CerebroGuardRpcImpl, CerebroGuardRpcServer};
+		module.merge(CerebroGuardRpcImpl::new(shared, pool).into_rpc())?;
+	}
 
-	io.extend_with(SystemApi::to_delegate(FullSystem::new(
-		client.clone(),
-		pool,
-		deny_unsafe,
-	)));
+	module.merge(LiquidationWorker::new(pepl_status).into_rpc())?;
+	module.merge(System::new(client.clone(), pool).into_rpc())?;
+	module.merge(TransactionPayment::new(client.clone()).into_rpc())?;
+	module.merge(StateMigration::new(client.clone(), backend.clone()).into_rpc())?;
 
-	io.extend_with(TransactionPaymentApi::to_delegate(TransactionPayment::new(
-		client.clone(),
-	)));
+	module.merge(IceSolverWorker::new(ice_solver_task_data).into_rpc())?;
 
-	// Extend this RPC with a custom API by using the following syntax.
-	// `YourRpcStruct` should have a reference to a client, which is needed
-	// to call into the runtime.
-	// `io.extend_with(YourRpcTrait::to_delegate(YourRpcStruct::new(ReferenceToClient, ...)));`
-
-	io.extend_with(XYKApi::to_delegate(XYK::new(client.clone())));
-
-	io.extend_with(sc_consensus_babe_rpc::BabeApi::to_delegate(BabeRpcHandler::new(
-		client,
-		shared_epoch_changes,
-		keystore,
-		babe_config,
-		select_chain,
-		deny_unsafe,
-	)));
-	io.extend_with(sc_finality_grandpa_rpc::GrandpaApi::to_delegate(
-		GrandpaRpcHandler::new(
-			shared_authority_set,
-			shared_voter_state,
-			justification_stream,
-			subscription_executor,
-			finality_provider,
-		),
-	));
-
-	io
+	Ok(module)
 }
 
-/// Instantiate all Light RPC extensions.
-pub fn create_light<C, P, M, F>(deps: LightDeps<C, F, P>) -> jsonrpc_core::IoHandler<M>
+/// Instantiate Ethereum-compatible RPC extensions.
+pub fn create<C, BE, P, CT>(
+	mut io: RpcExtension,
+	deps: Deps<C, P, CT>,
+	subscription_task_executor: SubscriptionTaskExecutor,
+	pubsub_notification_sinks: Arc<
+		fc_mapping_sync::EthereumBlockNotificationSinks<fc_mapping_sync::EthereumBlockNotification<Block>>,
+	>,
+) -> Result<RpcExtension, Box<dyn std::error::Error + Send + Sync>>
 where
-	C: sp_blockchain::HeaderBackend<Block>,
-	C: Send + Sync + 'static,
-	F: sc_client_api::light::Fetcher<Block> + 'static,
-	P: TransactionPool + 'static,
-	M: jsonrpc_core::Metadata + Default,
+	C: ProvideRuntimeApi<Block>,
+	C::Api: BlockBuilderApi<Block> + EthereumRuntimeRPCApi<Block> + ConvertTransactionRuntimeApi<Block>,
+	C: BlockchainEvents<Block> + 'static,
+	C: HeaderBackend<Block> + HeaderMetadata<Block, Error = BlockChainError> + StorageProvider<Block, BE>,
+	C: CallApiAt<Block>,
+	BE: Backend<Block> + 'static,
+	BE::State: StateBackend<BlakeTwo256>,
+	P: TransactionPool<Block = Block, Hash = sp_core::H256> + 'static,
+	CT: ConvertTransaction<<Block as BlockT>::Extrinsic> + Send + Sync + 'static,
 {
-	use substrate_frame_rpc_system::{LightSystem, SystemApi};
+	use fc_rpc::{
+		Eth, EthApiServer, EthDevSigner, EthFilter, EthFilterApiServer, EthPubSub, EthPubSubApiServer, EthSigner, Net,
+		NetApiServer, Web3, Web3ApiServer,
+	};
 
-	let LightDeps {
+	let Deps {
 		client,
 		pool,
-		remote_blockchain,
-		fetcher,
+		graph,
+		converter,
+		is_authority,
+		enable_dev_signer,
+		network,
+		sync,
+		frontier_backend,
+		overrides,
+		block_data_cache,
+		filter_pool,
+		max_past_logs,
+		fee_history_cache,
+		fee_history_cache_limit,
+		execute_gas_limit_multiplier,
 	} = deps;
-	let mut io = jsonrpc_core::IoHandler::default();
-	io.extend_with(SystemApi::<Hash, AccountId, Index>::to_delegate(LightSystem::new(
-		client,
-		remote_blockchain,
-		fetcher,
-		pool,
-	)));
 
-	io
+	// Clones for the custom `eth_getLogs` (registered below) — `frontier_backend`
+	// and `block_data_cache` are moved into `EthFilter::new`.
+	let getlogs_client = client.clone();
+	let getlogs_backend = frontier_backend.clone();
+	let getlogs_cache = block_data_cache.clone();
+	let getlogs_max = max_past_logs;
+
+	let mut signers = Vec::new();
+	if enable_dev_signer {
+		signers.push(Box::new(EthDevSigner::new()) as Box<dyn EthSigner>);
+	}
+
+	let pending_create_inherent_data_providers = move |_, _| async move {
+		let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
+		// Create a dummy parachain inherent data provider which is required to pass
+		// the checks by the para chain system. We use dummy values because in the 'pending context'
+		// neither do we have access to the real values nor do we need them.
+		let (relay_parent_storage_root, relay_chain_state) =
+			RelayStateSproofBuilder::default().into_state_root_and_proof();
+		let vfp = PersistedValidationData {
+			// This is a hack to make `cumulus_pallet_parachain_system::RelayNumberStrictlyIncreases`
+			// happy. Relay parent number can't be bigger than u32::MAX.
+			relay_parent_number: u32::MAX,
+			relay_parent_storage_root,
+			..Default::default()
+		};
+		let parachain_inherent_data = ParachainInherentData {
+			validation_data: vfp,
+			relay_chain_state,
+			downward_messages: Default::default(),
+			horizontal_messages: Default::default(),
+			collator_peer_id: None,
+			relay_parent_descendants: Default::default(),
+		};
+		Ok((timestamp, parachain_inherent_data))
+	};
+
+	io.merge(
+		Eth::<_, _, _, _, _, _, HydraDxEthConfig<_, _>>::new(
+			client.clone(),
+			pool.clone(),
+			graph.clone(),
+			converter,
+			sync.clone(),
+			vec![],
+			overrides.clone(),
+			frontier_backend.clone(),
+			is_authority,
+			block_data_cache.clone(),
+			fee_history_cache,
+			fee_history_cache_limit,
+			execute_gas_limit_multiplier,
+			None,
+			pending_create_inherent_data_providers,
+			None,
+		)
+		.replace_config::<HydraDxEthConfig<C, BE>>()
+		.into_rpc(),
+	)?;
+
+	io.merge(
+		EthFilter::new(
+			client.clone(),
+			frontier_backend,
+			graph,
+			filter_pool,
+			500_usize, // max stored filters
+			max_past_logs,
+			u32::MAX,
+			block_data_cache,
+		)
+		.into_rpc(),
+	)?;
+
+	// Replace fc-rpc's `eth_getLogs` with the synth-aware, canonical-hash filter:
+	// fc-rpc derives `log.blockHash` from `current_block().header`, so it must stay
+	// canonical (no bloom mutation) to round-trip via `eth_getBlockByHash`.
+	io.remove_method("eth_getLogs");
+	io.register_async_method("eth_getLogs", move |params, _ctx, _ext| {
+		let client = getlogs_client.clone();
+		let backend = getlogs_backend.clone();
+		let cache = getlogs_cache.clone();
+		async move {
+			let filter = params.one::<fc_rpc_core::types::Filter>()?;
+			crate::synthetic_logs::eth_filter::logs(client, backend, cache, getlogs_max, filter).await
+		}
+	})?;
+
+	io.merge(
+		EthPubSub::new(
+			pool,
+			client.clone(),
+			sync,
+			subscription_task_executor,
+			overrides,
+			pubsub_notification_sinks,
+		)
+		.into_rpc(),
+	)?;
+
+	io.merge(
+		Net::new(
+			client.clone(),
+			network,
+			// Whether to format the `peer_count` response as Hex (default) or not.
+			true,
+		)
+		.into_rpc(),
+	)?;
+
+	io.merge(Web3::new(client).into_rpc())?;
+
+	Ok(io)
+}
+
+impl<C, P, CT: Clone> Clone for Deps<C, P, CT> {
+	fn clone(&self) -> Self {
+		Self {
+			client: self.client.clone(),
+			pool: self.pool.clone(),
+			graph: self.graph.clone(),
+			converter: self.converter.clone(),
+			is_authority: self.is_authority,
+			enable_dev_signer: self.enable_dev_signer,
+			network: self.network.clone(),
+			sync: self.sync.clone(),
+			frontier_backend: self.frontier_backend.clone(),
+			overrides: self.overrides.clone(),
+			block_data_cache: self.block_data_cache.clone(),
+			filter_pool: self.filter_pool.clone(),
+			max_past_logs: self.max_past_logs,
+			fee_history_cache: self.fee_history_cache.clone(),
+			fee_history_cache_limit: self.fee_history_cache_limit,
+			execute_gas_limit_multiplier: self.execute_gas_limit_multiplier,
+		}
+	}
 }

@@ -1,0 +1,41 @@
+[package]
+name = "hydradx-traits"
+version = "5.1.0"
+description = "Shared traits"
+authors = ["GalacticCouncil"]
+edition = "2021"
+license = "Apache 2.0"
+repository = "https://github.com/galacticcouncil/warehouse/tree/master/traits"
+
+[dependencies]
+codec = { workspace = true }
+scale-info = { workspace = true }
+serde = { workspace = true }
+impl-trait-for-tuples = { workspace = true }
+sp-arithmetic = { workspace = true }
+
+# Local dependencies
+primitives = { workspace = true }
+hydra-dx-math = { workspace = true }
+
+# Substrate dependencies
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+sp-std = { workspace = true }
+pallet-evm = { workspace = true }
+
+orml-traits = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+    "serde/std",
+    "codec/std",
+    "frame-support/std",
+    "frame-system/std",
+    "sp-std/std",
+    "primitives/std",
+    "pallet-evm/std",
+    "orml-traits/std",
+    "hydra-dx-math/std",
+]

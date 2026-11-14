@@ -1,83 +1,107 @@
-#![allow(clippy::upper_case_acronyms)]
+#![allow(clippy::large_enum_variant)]
 
-use structopt::StructOpt;
-use std::{fmt, str::FromStr};
+use crate::chain_spec;
+use clap::Parser;
+use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeInstanceError(String);
 
 impl fmt::Display for RuntimeInstanceError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		let RuntimeInstanceError(message) = self;
-        write!(f, "RuntimeInstanceError: {}", message)
-    }
-}
-
-#[derive(Debug, StructOpt)]
-pub enum RuntimeInstance {
-	HydraDX,
-	Testing,
-}
-
-impl RuntimeInstance {
-	fn variants() -> [&'static str; 2] {
-        ["hydradx", "testing"]
-    }
-
-	pub fn is_testing_runtime(&self) -> bool {
-		match self {
-			Self::HydraDX => false,
-			Self::Testing => true,
-		}
+		write!(f, "RuntimeInstanceError: {message}")
 	}
 }
 
-impl fmt::Display for RuntimeInstance {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-			Self::HydraDX => write!(f, "hydradx"),
-			Self::Testing => write!(f, "testing"),
-		}
-    }
+#[derive(Debug, Parser)]
+#[clap(
+	propagate_version = true,
+	args_conflicts_with_subcommands = true,
+	subcommand_negates_reqs = true
+)]
+pub struct RunCmd {
+	#[clap(flatten)]
+	pub base: cumulus_client_cli::RunCmd,
+
+	/// Disable fork-aware transaction pool and use legacy single-state pool instead
+	#[arg(long, default_value_t = false)]
+	pub disable_fork_aware_pool: bool,
 }
 
-impl Default for RuntimeInstance {
-	fn default() -> Self { RuntimeInstance::HydraDX }
-}
-
-impl FromStr for RuntimeInstance {
-	type Err = RuntimeInstanceError;
-
-	fn from_str(input: &str) -> Result<Self, Self::Err> {
-		let input_lower = input.to_lowercase();
-		match input_lower.as_str() {
-			"testing" => Ok( RuntimeInstance::Testing ),
-			"hydradx" | "" => Ok( RuntimeInstance::HydraDX ),
-			other => Err(RuntimeInstanceError( format!("Invalid variant: `{}`", other)))
-		}
-	}
-}
-
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Parser)]
 pub struct Cli {
-	#[structopt(subcommand)]
+	#[clap(subcommand)]
 	pub subcommand: Option<Subcommand>,
 
-	#[structopt(flatten)]
+	#[clap(flatten)]
 	pub run: RunCmd,
+
+	/// Disable automatic hardware benchmarks.
+	///
+	/// By default these benchmarks are automatically ran at startup and measure
+	/// the CPU speed, the memory bandwidth and the disk speed.
+	///
+	/// The results are then printed out in the logs, and also sent as part of
+	/// telemetry, if telemetry is enabled.
+	#[arg(long)]
+	pub no_hardware_benchmarks: bool,
+
+	/// Relaychain arguments
+	#[clap(raw = true)]
+	pub relaychain_args: Vec<String>,
+
+	#[clap(flatten)]
+	pub ethereum_config: crate::service::evm::EthereumConfig,
+
+	#[arg(long)]
+	/// Disable override of TX priorities by the client.
+	pub no_tx_priority_override: bool,
+
+	/// Liquidation worker configuration
+	#[clap(flatten)]
+	pub liquidation_worker_config: pepl_worker::LiquidationWorkerCli,
+
+	/// ICE solver worker configuration
+	#[clap(flatten)]
+	pub ice_solver_worker_config: crate::ice_solver_worker::IceSolverWorkerConfig,
+
+	/// Block guard configuration
+	#[clap(flatten)]
+	pub cerebro_guard_config: crate::cerebro_guard::CerebroGuardCli,
 }
 
-#[derive(Debug, StructOpt)]
-pub struct RunCmd {
-	#[structopt(flatten)]
-	pub base: sc_cli::RunCmd,
+#[derive(Debug)]
+pub struct RelayChainCli {
+	/// The actual relay chain cli object.
+	pub base: polkadot_cli::RunCmd,
 
-	/// Specify the runtime used by the node.
-	#[structopt(default_value, long, possible_values = &RuntimeInstance::variants(), case_insensitive = true)]
-	pub runtime: RuntimeInstance,
+	/// Optional chain id that should be passed to the relay chain.
+	pub chain_id: Option<String>,
+
+	/// The base path that should be used by the relay chain.
+	pub base_path: Option<PathBuf>,
 }
 
-#[derive(Debug, StructOpt)]
+impl RelayChainCli {
+	/// Parse the relay chain CLI parameters using the para chain `Configuration`.
+	pub fn new<'a>(
+		para_config: &sc_service::Configuration,
+		relay_chain_args: impl Iterator<Item = &'a String>,
+	) -> Self {
+		let extension = chain_spec::Extensions::try_get(&para_config.chain_spec);
+		let chain_id = extension.map(|e| e.relay_chain.clone());
+		let base_path = para_config.base_path.path().join("polkadot");
+		Self {
+			base: polkadot_cli::RunCmd::parse_from(relay_chain_args),
+			chain_id,
+			base_path: Some(base_path),
+		}
+	}
+}
+
+#[derive(Debug, Parser)]
 pub enum Subcommand {
 	/// Build a chain specification.
 	BuildSpec(sc_cli::BuildSpecCmd),
@@ -95,12 +119,25 @@ pub enum Subcommand {
 	ImportBlocks(sc_cli::ImportBlocksCmd),
 
 	/// Remove the whole chain.
-	PurgeChain(sc_cli::PurgeChainCmd),
+	PurgeChain(cumulus_client_cli::PurgeChainCmd),
 
 	/// Revert the chain to a previous state.
 	Revert(sc_cli::RevertCmd),
 
 	/// The custom benchmark subcommmand benchmarking runtime pallets.
-	#[structopt(name = "benchmark", about = "Benchmark runtime pallets.")]
+	#[clap(subcommand)]
 	Benchmark(frame_benchmarking_cli::BenchmarkCmd),
+
+	/// Export the genesis state of the parachain.
+	#[clap(name = "export-genesis-state")]
+	ExportGenesisHead(cumulus_client_cli::ExportGenesisHeadCommand),
+
+	/// Export the genesis wasm of the parachain.
+	#[clap(name = "export-genesis-wasm")]
+	ExportGenesisWasm(cumulus_client_cli::ExportGenesisWasmCommand),
+
+	/// Try-runtime has migrated to a standalone
+	/// [CLI](<https://github.com/paritytech/try-runtime-cli>). The subcommand exists as a stub and
+	/// deprecation notice. It will be removed entirely some time after January 2024.
+	TryRuntime,
 }
